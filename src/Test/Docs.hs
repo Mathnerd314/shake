@@ -64,10 +64,11 @@ main = shaken (\a b -> unless brokenHaddock $ noTest a b) $ \args obj -> do
             ,"import Data.ByteString(ByteString)"
             ,"import Data.Char"
             ,"import Data.Data"
-            ,"import Data.List"
+            ,"import Data.List.Extra"
+            ,"import System.Time.Extra"
             ,"import Data.Maybe"
             ,"import Data.Monoid"
-            ,"import Development.Shake"
+            ,"import Development.Shake hiding ((*>),trackAllow)"
             ,"import Development.Shake.Classes"
             ,"import Development.Shake.Rule hiding (trackAllow)"
             ,"import Development.Shake.Util"
@@ -77,6 +78,7 @@ main = shaken (\a b -> unless brokenHaddock $ noTest a b) $ \args obj -> do
             ,"import qualified System.Directory"
             ,"import System.Process"
             ,"import System.Exit"
+            ,"import Control.Applicative"
             ,"import Control.Monad.IO.Class"
             ,"import System.IO"] ++
             ["import " ++ replace "_" "." (drop 5 $ takeBaseName out) | not $ "_md.hs" `isSuffixOf` out] ++
@@ -85,6 +87,9 @@ main = shaken (\a b -> unless brokenHaddock $ noTest a b) $ \args obj -> do
             ,"(==>) = undefined"
             ,"(<==) = ()"
             ,"infix 1 ==>"
+            ,"infix 0 ==="
+            ,"(===) :: a -> a -> b"
+            ,"(===) = undefined"
             ,"forAll f = f undefined"
             ,"remaining = 1.1"
             ,"done = 1.1"
@@ -102,6 +107,10 @@ main = shaken (\a b -> unless brokenHaddock $ noTest a b) $ \args obj -> do
             ,"myVariable = ()"
             ,"instance Eq (OptDescr a)"
             ,"(foo,bar,baz) = undefined"
+            ,"(p1,p2) = (0.0, 0.0)"
+            ,"(r1,r2) = (return () :: Rules(), return () :: Rules())"
+            ,"xs = []"
+            ,"ys = []"
             ,"out = \"\""
             ,"str1 = \"\""
             ,"str2 = \"\""
@@ -199,7 +208,7 @@ isBindStmt x = "let " `isPrefixOf` x || " <- " `isInfixOf` x
 isDecl :: String -> Bool
 isDecl x | fst (word1 x) `elem` ["import","infix","instance","newtype"] = True
 isDecl (words -> name:"::":_) | all isAlphaNum name = True -- foo :: Type Signature
-isDecl x | "=" `elem` takeWhile (`notElem` ["let","where"]) (words x) = True -- foo arg1 arg2 = an implementation
+isDecl x | "=" `elem` takeWhile (`notElem` ["let","where"]) (words $ takeWhile (/= '{') x) = True -- foo arg1 arg2 = an implementation
 isDecl _ = False
 
 
@@ -248,8 +257,8 @@ types :: [String]
 types = words $
     "MVar IO String FilePath Maybe [String] Char ExitCode Change " ++
     "Action Resource Assume FilePattern Development.Shake.FilePattern " ++
-    "Lint Verbosity Rules CmdOption Int Double " ++
-    "NFData Binary Hashable Eq Typeable Show " ++
+    "Lint Verbosity Rules CmdOption Int Double Bool " ++
+    "NFData Binary Hashable Eq Typeable Show Applicative " ++
     "CmdResult ByteString ProcessHandle Rule Monad Monoid Data TypeRep"
 
 -- | Duplicated identifiers which require renaming
@@ -262,11 +271,16 @@ isFilePath x = all validChar  x && ("foo/" `isPrefixOf` x || takeExtension x `el
     where
         validChar x = isAlphaNum x || x `elem` "_./*"
         exts = words $ ".txt .hi .hs .o .exe .tar .cpp .cfg .dep .out .deps .m .h .c .html .zip " ++
-                       ".js .json .trace .database .src .sh .bat .ninja .rot13 .version .digits"
+                       ".js .json .trace .database .src .sh .bat .ninja .rot13 .version .digits .prof .md"
 
 isCmdFlag :: String -> Bool
-isCmdFlag x = length a >= 1 && length a <= 2 && all (\x -> isAlphaNum x || x `elem` "-=/_") b
+isCmdFlag "+RTS" = True
+isCmdFlag x = length a >= 1 && length a <= 2 && all (\x -> isAlphaNum x || x `elem` "-=/_[]") b
     where (a,b) = span (== '-') x
+
+isCmdFlags :: String -> Bool
+isCmdFlags = all (\x -> let y = fromMaybe x $ stripSuffix "," x in isCmdFlag y || isArg y) . words
+    where isArg = all (\x -> isUpper x || x == '=')
 
 isEnvVar :: String -> Bool
 isEnvVar x | Just x <- stripPrefix "$" x = all validChar x
@@ -276,11 +290,11 @@ isEnvVar x | Just x <- stripPrefix "$" x = all validChar x
 
 isProgram :: String -> Bool
 isProgram (words -> x:xs) = x `elem` programs && all (\x -> isCmdFlag x || isFilePath x || all isAlpha x || x == "&&") xs
-    where programs = words "excel gcc cl make ghc cabal distcc build tar fsatrace ninja touch pwd runhaskell rot13 main shake"
+    where programs = words "excel gcc cl make ghc cabal distcc build tar git fsatrace ninja touch pwd runhaskell rot13 main shake stack"
 
 -- | Should a fragment be whitelisted and not checked
 whitelist :: String -> Bool
-whitelist x | null x || isFilePath x || all isCmdFlag (words x) || isEnvVar x || isProgram x = True
+whitelist x | null x || isFilePath x || isCmdFlags x || isEnvVar x || isProgram x = True
 whitelist x | elem x $ words $
     "newtype do a q m c x value key os contents clean _make " ++
     ".. /. // \\ //* dir/*/* dir " ++
@@ -291,8 +305,8 @@ whitelist x | elem x $ words $
     "/usr/special /usr/special/userbinary " ++
     "Hidden extension xterm main opts result flagValues argValues " ++
     "HEADERS_DIR /path/to/dir CFLAGS let linkFlags temp code out err " ++
-    "_shake _shake/build manual " ++
-    "docs/manual _build _build/run depfile " ++
+    "_shake _shake/build manual chrome://tracing/ compdb " ++
+    "docs/manual foo.* _build _build/run depfile 0.000s " ++
     "@ndm_haskell file-name .PHONY filepath trim base stack extra #include " ++
     "*> "
     = True

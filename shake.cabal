@@ -1,7 +1,7 @@
 cabal-version:      >= 1.10
 build-type:         Simple
 name:               shake
-version:            0.15.5
+version:            0.15.6
 license:            BSD3
 license-file:       LICENSE
 category:           Development, Shake
@@ -55,8 +55,6 @@ extra-source-files:
     src/Test/Tup/newmath/square.h
     src/Paths.hs
     docs/Manual.md
-    docs/Ninja.md
-    docs/Why.md
     docs/shake-progress.png
 
 data-files:
@@ -84,6 +82,7 @@ library
     hs-source-dirs:   src
     build-depends:
         base == 4.*,
+        ansi-terminal,
         directory,
         hashable >= 1.1.2.3,
         binary,
@@ -97,7 +96,7 @@ library
         js-jquery,
         js-flot,
         transformers >= 0.2,
-        extra >= 1.4.3,
+        extra >= 1.4.4,
         deepseq >= 1.1
 
     if flag(portable)
@@ -118,6 +117,7 @@ library
         Development.Shake.FilePath
         Development.Shake.Forward
         Development.Shake.Rule
+        Development.Shake.Rules.File
         Development.Shake.Util
 
     other-modules:
@@ -128,8 +128,10 @@ library
         Development.Shake.Args
         Development.Shake.ByteString
         Development.Shake.Core
+        Development.Shake.Core2
         Development.Shake.CmdOption
         Development.Shake.Database
+        Development.Shake.Database2
         Development.Shake.Demo
         Development.Shake.Derived
         Development.Shake.Errors
@@ -141,7 +143,6 @@ library
         Development.Shake.Progress
         Development.Shake.Resource
         Development.Shake.Rules.Directory
-        Development.Shake.Rules.File
         Development.Shake.Rules.Files
         Development.Shake.Rules.Oracle
         Development.Shake.Rules.OrderOnly
@@ -176,6 +177,7 @@ executable shake
         ghc-options: -threaded "-with-rtsopts=-I0 -qg -qb"
     build-depends:
         base == 4.*,
+        ansi-terminal,
         directory,
         hashable >= 1.1.2.3,
         binary,
@@ -190,7 +192,8 @@ executable shake
         js-flot,
         transformers >= 0.2,
         extra >= 1.4.3,
-        deepseq >= 1.1
+        deepseq >= 1.1,
+        primitive
 
     if flag(portable)
         cpp-options: -DPORTABLE
@@ -220,7 +223,9 @@ executable shake
         Development.Shake.CmdOption
         Development.Shake.Command
         Development.Shake.Core
+        Development.Shake.Core2
         Development.Shake.Database
+        Development.Shake.Database2
         Development.Shake.Demo
         Development.Shake.Derived
         Development.Shake.Errors
@@ -262,15 +267,20 @@ executable shake
 test-suite shake-test
     default-language: Haskell2010
     type: exitcode-stdio-1.0
-    ghc-options: -main-is Test.main -with-rtsopts=-K1K
     main-is: Test.hs
     hs-source-dirs: src
-    ghc-options: -rtsopts
-    -- GHC bug 7646 means -threaded causes errors
+
+    ghc-options: -main-is Test.main -rtsopts
+    if impl(ghc >= 7.6)
+        -- space leak introduced by -O1 in 7.4, see #445
+        ghc-options: -with-rtsopts=-K1K
     if impl(ghc >= 7.8)
+        -- GHC bug 7646 (fixed in 7.8) means -threaded causes errors
         ghc-options: -threaded
+
     build-depends:
         base == 4.*,
+        ansi-terminal,
         directory,
         hashable >= 1.1.2.3,
         binary,
@@ -317,7 +327,9 @@ test-suite shake-test
         Development.Shake.Command
         Development.Shake.Config
         Development.Shake.Core
+        Development.Shake.Core2
         Development.Shake.Database
+        Development.Shake.Database2
         Development.Shake.Demo
         Development.Shake.Derived
         Development.Shake.Errors
@@ -377,6 +389,7 @@ test-suite shake-test
         Test.Live
         Test.Makefile
         Test.Manual
+        Test.Match
         Test.Monad
         Test.Ninja
         Test.Oracle

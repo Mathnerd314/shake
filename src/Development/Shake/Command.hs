@@ -13,7 +13,6 @@ module Development.Shake.Command(
     command, command_, cmd, unit, CmdArguments, (:->),
     Stdout(..), Stderr(..), Stdouterr(..), Exit(..), Process(..), CmdTime(..), CmdLine(..),
     CmdResult, CmdString, CmdOption(..),
-    addPath, addEnv,
     ) where
 
 import Data.Tuple.Extra
@@ -44,47 +43,10 @@ import Development.Shake.FilePath
 import Development.Shake.FilePattern
 import Development.Shake.Types
 import Development.Shake.Rules.File
-import Development.Shake.Derived(writeFile', withTempDir)
+import Development.Shake.Derived
 
 ---------------------------------------------------------------------
 -- ACTUAL EXECUTION
-
--- | /Deprecated:/ Use 'AddPath'. This function will be removed in a future version.
---
---   Add a prefix and suffix to the @$PATH@ environment variable. For example:
---
--- @
--- opt <- 'addPath' [\"\/usr\/special\"] []
--- 'cmd' opt \"userbinary --version\"
--- @
---
---   Would prepend @\/usr\/special@ to the current @$PATH@, and the command would pick
---   @\/usr\/special\/userbinary@, if it exists. To add other variables see 'addEnv'.
-addPath :: MonadIO m => [String] -> [String] -> m CmdOption
-addPath pre post = do
-    args <- liftIO getEnvironment
-    let (path,other) = partition ((== "PATH") . (if isWindows then upper else id) . fst) args
-    return $ Env $
-        [("PATH",intercalate [searchPathSeparator] $ pre ++ post) | null path] ++
-        [(a,intercalate [searchPathSeparator] $ pre ++ [b | b /= ""] ++ post) | (a,b) <- path] ++
-        other
-
--- | /Deprecated:/ Use 'AddEnv'. This function will be removed in a future version.
---
---   Add a single variable to the environment. For example:
---
--- @
--- opt <- 'addEnv' [(\"CFLAGS\",\"-O2\")]
--- 'cmd' opt \"gcc -c main.c\"
--- @
---
---   Would add the environment variable @$CFLAGS@ with value @-O2@. If the variable @$CFLAGS@
---   was already defined it would be overwritten. If you wish to modify @$PATH@ see 'addPath'.
-addEnv :: MonadIO m => [(String, String)] -> m CmdOption
-addEnv extra = do
-    args <- liftIO getEnvironment
-    return $ Env $ extra ++ filter (\(a,_) -> a `notElem` map fst extra) args
-
 
 data Str = Str String | BS BS.ByteString | LBS LBS.ByteString | Unit deriving Eq
 
@@ -113,11 +75,11 @@ commandExplicit funcName oopts results exe args = do
         ,shakeLint,shakeLintInside,shakeLintIgnore} <- getShakeOptions
     let fopts = shakeCommandOptions ++ oopts
     let useShell = Shell `elem` fopts
-    let useLint = shakeLint == Just LintFSATrace
+    let useLint = shakeLint == LintFSATrace
     let useAutoDeps = AutoDeps `elem` fopts
     let opts = filter (/= Shell) fopts
 
-    let skipper act = if null results && not shakeRunCommands then return [] else act
+    let skipper act = if null results && shakeRunCommands < RunCommands then return [] else act
 
     let verboser act = do
             let cwd = listToMaybe $ reverse [x | Cwd x <- opts]
@@ -137,15 +99,42 @@ commandExplicit funcName oopts results exe args = do
             | otherwise = act exe args
 
         shelled = runShell (unwords $ exe : args)
-                              
+
         ignore = map (?==) shakeLintIgnore
         ham cwd xs = [makeRelative cwd x | x <- map toStandard xs
                                          , any (`isPrefixOf` x) shakeLintInside
                                          , not $ any ($ x) ignore]
 
         fsaCmd act opts file
+            | isMac = fsaCmdMac act opts file
             | useShell = runShell (unwords $ exe : args) $ \exe args -> act "fsatrace" $ opts : file : "--" : exe : args
             | otherwise = act "fsatrace" $ opts : file : "--" : exe : args
+
+        fsaCmdMac act opts file = do
+            let fakeExe e = liftIO $ do
+                    me <- findExecutable e
+                    case me of
+                        Just re -> do
+                            let isSystem = any (`isPrefixOf` re) [ "/bin"
+                                                                 , "/usr"
+                                                                 , "/sbin"
+                                                                 ]
+                            if isSystem
+                                then do
+                                    tmpdir <- getTemporaryDirectory
+                                    let fake = tmpdir ++ "fsatrace-fakes" ++ re
+                                    unlessM (doesFileExist fake) $ do
+                                        createDirectoryIfMissing True $ takeDirectory fake
+                                        copyFile re fake
+                                    return fake
+                                else return re
+                        Nothing -> return e
+            fexe <- fakeExe exe
+            if useShell
+                then do
+                    fsh <- fakeExe "/bin/sh"
+                    act "fsatrace" $ opts : file : "--" : fsh : "-c" : [unwords $ fexe : args]
+                else act "fsatrace" $ opts : file : "--" : fexe : args
 
         fsatrace act = withTempFile $ \file -> do
             res <- fsaCmd act "rwm" file
@@ -159,7 +148,7 @@ commandExplicit funcName oopts results exe args = do
             let reads = ham cwd rs
                 writes = ham cwd ws
             when useAutoDeps $
-                needed reads
+                unsafeAllowApply $ needed reads
             trackRead reads
             trackWrite writes
             return res
@@ -169,7 +158,7 @@ commandExplicit funcName oopts results exe args = do
             pxs <- liftIO $ parseFSAT <$> readFileUTF8' file
             xs <- liftIO $ filterM doesFileExist [x | FSATRead x <- pxs]
             cwd <- liftIO getCurrentDirectory
-            needNorm $ ham cwd xs
+            unsafeAllowApply $ needNorm $ ham cwd xs
             return res
 
     skipper $ tracker $ \exe args -> verboser $ tracer $ commandExplicitIO funcName opts results exe args
@@ -559,12 +548,6 @@ instance Arg a => Arg (Maybe a) where arg = maybe [] arg
 
 ---------------------------------------------------------------------
 -- UTILITIES
-
--- Copied from Derived. Once Derived no longer exports cmd stuff, import from there.
-withTempFile :: (FilePath -> Action a) -> Action a
-withTempFile act = do
-    (file, del) <- liftIO newTempFile
-    act file `actionFinally` del
 
 -- A better version of showCommandForUser, which doesn't escape so much on Windows
 showCommandForUser2 :: FilePath -> [String] -> String

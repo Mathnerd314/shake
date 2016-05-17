@@ -1,7 +1,7 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving, FlexibleInstances, MultiParamTypeClasses #-}
 
 module General.Intern(
-    Intern, Id,
+    Intern, Id(..),
     empty, insert, add, lookup, toList, fromList
     ) where
 
@@ -17,11 +17,6 @@ data Intern a = Intern {-# UNPACK #-} !Word32 !(Map.HashMap a Id)
 
 newtype Id = Id Word32
     deriving (Eq,Hashable,Binary,Show,NFData)
-
-instance BinaryWith w Id where
-    putWith ctx = put
-    getWith ctx = get
-
 
 empty :: Intern a
 empty = Intern 0 Map.empty

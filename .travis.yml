@@ -1,3 +1,4 @@
+sudo: required
 env:
  - GHCVER=7.4.2
  - GHCVER=7.6.3
@@ -5,11 +6,6 @@ env:
  - GHCVER=7.10.3
  - GHCVER=8.0.1
  - GHCVER=head
-
-matrix:
-  allow_failures:
-   - env: GHCVER=8.0.1 # GHC bug 11458
-   - env: GHCVER=head
 
 script:
  - git clone https://github.com/jacereda/fsatrace.git

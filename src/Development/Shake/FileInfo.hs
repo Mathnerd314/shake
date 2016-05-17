@@ -1,18 +1,18 @@
-{-# LANGUAGE GeneralizedNewtypeDeriving, DeriveDataTypeable, CPP, ForeignFunctionInterface #-}
+{-# LANGUAGE DeriveAnyClass, DeriveGeneric, DeriveDataTypeable, CPP, ForeignFunctionInterface, LambdaCase #-}
 
 module Development.Shake.FileInfo(
-    FileInfo, fileInfoEq, fileInfoNeq,
+    FileInfo(FileEq,FileNeq), (=?=),
     FileSize, ModTime, FileHash,
     getFileHash, getFileInfo
     ) where
 
+import GHC.Generics
 import Control.Exception.Extra
 import Development.Shake.Classes
+import Development.Shake.Errors
 import General.String
 import qualified Data.ByteString.Lazy as LBS
-import Data.Char
 import Data.Word
-import Numeric
 import System.IO
 
 #if defined(PORTABLE)
@@ -35,27 +35,31 @@ import System.IO.Error
 import System.Posix.Files.ByteString
 #endif
 
--- A piece of file information, where 0 and 1 are special (see fileInfo* functions)
-newtype FileInfo a = FileInfo Word32
-    deriving (Typeable,Hashable,Binary,NFData)
+-- | A piece of file information, with special equal and not-equal values
+data FileInfo a = FileEq -- ^ Equal to everything
+                   | FileNeq -- ^ Equal to nothing
+                   | FileInfo Word32 -- ^ in [2..maxBound]
+    deriving (Show,Eq,Typeable,Hashable,NFData,Generic)
 
-fileInfoEq, fileInfoNeq :: FileInfo a
-fileInfoEq  = FileInfo 0   -- Equal to everything
-fileInfoNeq = FileInfo 1   -- Equal to nothing
+instance Binary (FileInfo a) where
+    get = get >>= \case
+        0 -> return FileEq
+        1 -> return FileNeq
+        a -> return $ FileInfo a
+    put FileEq = put (0 :: Word32)
+    put FileNeq = put (1 :: Word32)
+    put (FileInfo a) | a >= 2 = put a
+                     | otherwise = err ("Invalid FileInfo")
 
+-- | Truncate a Word32 into FileInfo
 fileInfo :: Word32 -> FileInfo a
 fileInfo a = FileInfo $ if a > maxBound - 2 then a else a + 2
 
-instance Show (FileInfo a) where
-    show (FileInfo x)
-        | x == 0 = "EQ"
-        | x == 1 = "NEQ"
-        | otherwise = "0x" ++ map toUpper (showHex (x-2) "")
+infix 4 =?=
 
-instance Eq (FileInfo a) where
-    FileInfo a == FileInfo b
-        | a == 0 || b == 0 = True
-        | a == 1 || b == 1 = False
+-- | FileInfo comparison using the special equality semantics
+a =?= b | a == FileEq || b == FileEq = True
+        | a == FileNeq || b == FileNeq = False
         | otherwise = a == b
 
 data FileInfoHash; type FileHash = FileInfo FileInfoHash
@@ -73,11 +77,12 @@ getFileHash x = withFile (unpackU x) ReadMode $ \h -> do
 -- If the result isn't strict then we are referencing a much bigger structure,
 -- and it causes a space leak I don't really understand on Linux when running
 -- the 'tar' test, followed by the 'benchmark' test.
+-- See this blog post: http://neilmitchell.blogspot.co.uk/2015/09/three-space-leaks.html
 result :: Word32 -> Word32 -> IO (Maybe (ModTime, FileSize))
 result x y = do
     x <- evaluate $ fileInfo x
     y <- evaluate $ fileInfo y
-    return $! Just $! (x, y)
+    return $! Just (x, y)
 
 
 getFileInfo :: BSU -> IO (Maybe (ModTime, FileSize))
@@ -103,7 +108,13 @@ instance ExtractFileTime UTCTime where extractFileTime = floor . fromRational . 
 getFileInfo x = BS.useAsCString (unpackU_ x) $ \file ->
     alloca_WIN32_FILE_ATTRIBUTE_DATA $ \fad -> do
         res <- c_GetFileAttributesExA file 0 fad
-        let peek = join $ liftM2 result (peekLastWriteTimeLow fad) (peekFileSizeLow fad)
+        code <- peekFileAttributes fad
+        let peek = do
+                code <- peekFileAttributes fad
+                if testBit code 4 then
+                    errorIO $ "getFileInfo, expected a file, got a directory: " ++ unpackU x
+                 else
+                    join $ liftM2 result (peekLastWriteTimeLow fad) (peekFileSizeLow fad)
         if res then
             peek
          else if requireU x then withCWString (unpackU x) $ \file -> do
@@ -127,6 +138,10 @@ alloca_WIN32_FILE_ATTRIBUTE_DATA :: (Ptr WIN32_FILE_ATTRIBUTE_DATA -> IO a) -> I
 alloca_WIN32_FILE_ATTRIBUTE_DATA act = allocaBytes size_WIN32_FILE_ATTRIBUTE_DATA act
     where size_WIN32_FILE_ATTRIBUTE_DATA = 36
 
+peekFileAttributes :: Ptr WIN32_FILE_ATTRIBUTE_DATA -> IO Word32
+peekFileAttributes p = peekByteOff p index_WIN32_FILE_ATTRIBUTE_DATA_dwFileAttributes
+    where index_WIN32_FILE_ATTRIBUTE_DATA_dwFileAttributes = 0
+
 peekLastWriteTimeLow :: Ptr WIN32_FILE_ATTRIBUTE_DATA -> IO Word32
 peekLastWriteTimeLow p = peekByteOff p index_WIN32_FILE_ATTRIBUTE_DATA_ftLastWriteTime_dwLowDateTime
     where index_WIN32_FILE_ATTRIBUTE_DATA_ftLastWriteTime_dwLowDateTime = 20
@@ -140,7 +155,10 @@ peekFileSizeLow p = peekByteOff p index_WIN32_FILE_ATTRIBUTE_DATA_nFileSizeLow
 -- Unix version
 getFileInfo x = handleBool isDoesNotExistError (const $ return Nothing) $ do
     s <- getFileStatus $ unpackU_ x
-    result (extractFileTime s) (fromIntegral $ fileSize s)
+    if isDirectory s then
+        errorIO $ "getFileInfo, expected a file, got a directory: " ++ unpackU x
+     else
+        result (extractFileTime s) (fromIntegral $ fileSize s)
 
 extractFileTime :: FileStatus -> Word32
 #ifndef MIN_VERSION_unix

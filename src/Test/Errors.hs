@@ -60,9 +60,6 @@ main = shakenCwd test $ \args obj -> do
     obj "overlap.txt" %> \out -> writeFile' out "overlap.txt"
     obj "overlap.t*" %> \out -> writeFile' out "overlap.t*"
     obj "overlap.*" %> \out -> writeFile' out "overlap.*"
-    alternatives $ do
-        obj "alternative.t*" %> \out -> writeFile' out "alternative.txt"
-        obj "alternative.*" %> \out -> writeFile' out "alternative.*"
 
     obj "chain.2" %> \out -> do
         src <- readFile' $ obj "chain.1"
@@ -92,6 +89,12 @@ main = shakenCwd test $ \args obj -> do
     phony "fail2" $ fail "die2"
 
     when ("die" `elem` args) $ action $ error "death error"
+
+    obj "fresh_dir" %> \out -> liftIO $ createDirectoryIfMissing True out
+    obj "need_dir" %> \out -> do
+        liftIO $ createDirectoryIfMissing True $ obj "existing_dir"
+        need [obj "existing_dir"]
+        writeFile' out ""
 
 
     -- not tested by default since only causes an error when idle GC is turned on
@@ -147,9 +150,6 @@ test build obj = do
     build ["overlap.txt"]
     assertContents (obj "overlap.txt") "overlap.txt"
     crash ["overlap.txx"] ["key matches multiple rules","overlap.txx"]
-    build ["alternative.foo","alternative.txt"]
-    assertContents (obj "alternative.foo") "alternative.*"
-    assertContents (obj "alternative.txt") "alternative.txt"
 
     crash ["tempfile"] ["tempfile-died"]
     src <- readFile $ obj "tempfile"
@@ -165,3 +165,6 @@ test build obj = do
     putStrLn "## BUILD errors fail1 fail2 -k -j2"
     (out,_) <- IO.captureOutput $ try_ $ build ["fail1","fail2","-k","-j2",""]
     assert ("die1" `isInfixOf` out && "die2" `isInfixOf` out) $ "Expected 'die1' and 'die2', but got: " ++ out
+
+    crash ["fresh_dir"] ["expected a file, got a directory","fresh_dir"]
+    crash ["need_dir"] ["expected a file, got a directory","existing_dir"]

@@ -38,12 +38,13 @@ main = do
     files <- getDirectoryContents "../docs"
     code <- code "../dist/doc/html/shake/shake.txt"
     skeleton <- skeleton mode "parts" "output/index.css"
-    forM_ files $ \file -> do
-        when (takeExtension file == ".md") $ do
+    forM_ files $ \file -> case takeExtension file of
+        ".md" -> do
             putChar '.'
             p <- readPage mode code $ "../docs" </> file
-            skeleton ("output" </> map toLower (takeBaseName file) <.> "html") p 
-    copyFile "../docs/shake-progress.png" "output/shake-progress.png"
+            skeleton ("output" </> map toLower (takeBaseName file) <.> "html") p
+        ".png" -> copyFile ("../docs" </> file) ("output" </> file)
+        _ -> return ()
     copyFile "parts/favicon.ico" "output/favicon.ico"
     putStrLn " done"
 
@@ -82,7 +83,8 @@ readPage mode code file = do
         links (TagOpen linkLevel@['h',i] at:xs) | i `elem` "234" =
                 first ([Link{..} | i /= '4'] ++) $ second (prefix++) $ links rest
             where linkTitle = innerText $ takeWhile (/= TagClose linkLevel) xs
-                  linkKey = intercalate "-" $ map (map toLower . filter isAlpha) $ words linkTitle
+                  linkKey = intercalate "-" $ map (map toLower . filter isAlpha) $ words $
+                            takeWhile (`notElem` "?.!") $ fromMaybe linkTitle $ stripPrefix "Q: " linkTitle
                   (this,rest) = break (== TagClose linkLevel) xs
                   prefix = [TagOpen "span" [("class","target"),("id",linkKey)],TagClose "span"
                            ,TagOpen linkLevel at,TagOpen "a" [("href",'#':linkKey),("class","anchor")]] ++
@@ -105,7 +107,8 @@ reformat mode code (TagOpen "pre" []:TagOpen "code" []:xs) = reformat mode code 
 reformat mode code (TagClose "code":TagClose "pre":xs) = reformat mode code $ TagClose "pre" : xs
 reformat mode code (TagOpen t at:xs) | t `elem` ["pre","code"] = TagOpen t at : concatMap f a ++ reformat mode code b
     where (a,b) = break (== TagClose t) xs
-          f (TagText x) = code x
+          skip = TagComment " nosyntax " `elem` a || notCode (innerText a)
+          f (TagText x) | not skip = code x
           f x = [x]
 reformat mode code (TagClose x:xs) | x `elem` ["p","pre","li","ol","ul","h1","h2","h3","h4","h5","h6"] =
     TagClose x : TagText "\n" : reformat mode code xs
@@ -113,6 +116,15 @@ reformat mode code (x:xs) = x : reformat mode code xs
 reformat mode code [] = []
 
 noReadme x = fromMaybe x $ stripSuffix "#readme" x
+
+notCode :: String -> Bool
+notCode x =
+    "stack " `isPrefixOf` x ||
+    "shake-" `isPrefixOf` x ||
+    ("--" `isPrefixOf` x && length (lines x) == 1) ||
+    x == "shake" ||
+    (let t = takeExtension x in "." `isPrefixOf` t && all isAlpha (drop 1 t))
+
 
 ---------------------------------------------------------------------
 -- POPULATE A SKELETON
