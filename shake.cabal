@@ -87,6 +87,7 @@ library
         hashable >= 1.1.2.3,
         binary,
         filepath,
+        profunctors, lens, comonad,
         process >= 1.1,
         unordered-containers >= 0.2.1,
         bytestring,
@@ -182,6 +183,7 @@ executable shake
         hashable >= 1.1.2.3,
         binary,
         filepath,
+        profunctors, lens, comonad,
         process >= 1.1,
         unordered-containers >= 0.2.1,
         bytestring,
@@ -190,8 +192,13 @@ executable shake
         random,
         js-jquery,
         js-flot,
+<<<<<<< 081571aabed931e2fcfacb2998b3dabc7f271b34
         transformers >= 0.2,
         extra >= 1.4.8,
+=======
+        mtl, transformers >= 0.2,
+        extra >= 1.4.3,
+>>>>>>> Binary serialization experiment
         deepseq >= 1.1,
         primitive
 
@@ -285,6 +292,7 @@ test-suite shake-test
         hashable >= 1.1.2.3,
         binary,
         filepath,
+        profunctors, lens, comonad,
         process >= 1.1,
         unordered-containers >= 0.2.1,
         bytestring,
@@ -293,7 +301,7 @@ test-suite shake-test
         random,
         js-jquery,
         js-flot,
-        transformers >= 0.2,
+        mtl, transformers >= 0.2,
         deepseq >= 1.1,
         extra >= 1.4.8,
         QuickCheck >= 2.0

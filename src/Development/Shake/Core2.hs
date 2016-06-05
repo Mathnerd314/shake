@@ -17,8 +17,8 @@ import Data.Tuple.Extra
 import Control.Concurrent.Extra
 import Control.Monad.Extra
 import Control.Monad.IO.Class
-import Data.Typeable
 import Data.Dynamic
+import Data.Binary.Builder
 import Data.Function
 import Data.Either.Extra
 import Numeric.Extra
@@ -108,7 +108,7 @@ data BuiltinRule m = BuiltinRule
     }
 
 data BuiltinResult value = BuiltinResult
-    { resultStoreB :: Value -- ^ the associated store result
+    { resultStoreB :: Builder -- ^ the associated store result
     , resultValueB :: value -- ^ dynamic return value limited to lifetime of the program
     , ranDependsB :: Bool -- ^ whether the dependencies for this rule were 'apply'-d
     , unchangedB :: Bool -- ^ whether the value is the same, so that there is no need to run reverse dependencies

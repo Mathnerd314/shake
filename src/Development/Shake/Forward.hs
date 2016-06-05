@@ -55,12 +55,13 @@ import Numeric
 import Data.IORef
 import qualified Data.HashMap.Strict as Map
 
--{-# NOINLINE globalForwards #-}
-globalForwards :: IORef (Map.HashMap Value (Action Value))
-globalForwards = unsafePerformIO $ newIORef Map.empty
-
 newtype ForwardQ = ForwardQ Value
     deriving (Show,Typeable,Eq,Hashable,Binary,NFData)
+
+-{-# NOINLINE globalForwards #-}
+-- |
+globalForwards :: IORef (Map.HashMap Value (Action Value))
+globalForwards = unsafePerformIO $ newIORef Map.empty
 
 -- | Given an 'Action', turn it into a 'Rules' structure which runs in forward mode.
 forwardRule :: Action () -> Rules ()

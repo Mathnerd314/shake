@@ -77,7 +77,7 @@ data Status
 type DBStatus = Result -- ^ Loaded from the database
 
 data Result = Result
-    {result :: Value -- ^ the result associated with the Key
+    {result :: Builder -- ^ the result associated with the Key
     ,built :: {-# UNPACK #-} !Step -- ^ when it was actually run
     ,changed :: {-# UNPACK #-} !Step -- ^ the step for deciding if it's valid
     ,depends :: Depends -- ^ dependencies (stored in order of appearance)
