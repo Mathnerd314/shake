@@ -1,5 +1,5 @@
-{-# LANGUAGE RecordWildCards, GeneralizedNewtypeDeriving, ScopedTypeVariables, PatternGuards #-}
-{-# LANGUAGE ExistentialQuantification, MultiParamTypeClasses, ConstraintKinds #-}
+{-# LANGUAGE RecordWildCards, GeneralizedNewtypeDeriving, ScopedTypeVariables, PatternGuards, ViewPatterns #-}
+{-# LANGUAGE ExistentialQuantification, MultiParamTypeClasses, ConstraintKinds, DeriveFunctor #-}
 
 module Development.Shake.Internal.Core.Run(
     run,
@@ -12,7 +12,7 @@ module Development.Shake.Internal.Core.Run(
     parallel,
     orderOnlyAction,
     -- Internal stuff
-    runAfter
+    runAfter,
     ) where
 
 import Control.Exception.Extra
@@ -22,13 +22,15 @@ import Control.Concurrent.Extra
 import Control.Monad.Extra
 import Control.Monad.IO.Class
 import Data.Typeable.Extra
+import Control.Monad.Trans.Writer.Strict
+import Data.Dynamic
+import General.Binary
 import Data.Function
 import Data.Either.Extra
 import Data.List.Extra
 import qualified Data.HashMap.Strict as Map
 import Data.Maybe
 import Data.IORef
-import System.Directory
 import System.IO.Extra
 import System.Time.Extra
 
@@ -45,19 +47,118 @@ import Development.Shake.Internal.Types
 import Development.Shake.Internal.Errors
 import Development.Shake.Internal.Special
 import General.Timing
+
+import Data.Monoid
+
 import General.Extra
-import General.Concurrent
 import General.Cleanup
 import Prelude
 
 ---------------------------------------------------------------------
 -- MAKE
 
+-- | Define a built-in Shake rule.
+--
+--   A rule for a type of artifacts (e.g. /files/) provides:
+--
+-- * How to identify artifacts, given by the @key@ type.
+--
+-- * A way to produce a 'BuiltinResult', given the key value, the previous result, and whether
+--   any dependencies have changed. Usually, this will 'userRule' to get the user-defined rules,
+--   but you can use 'getUserRules' for customized matching behavior or avoid user rules entirely.
+--
+--   As an example, below is a simplified rule for building files, where files are identified
+--   by a 'FilePath' and their state is identified by their modification time.
+--   (the builtin functions 'Development.Shake.need' and 'Development.Shake.%>'
+--   provide a similar rule).
+--
+-- @
+-- newtype File = File FilePath deriving (Show, Typeable, Eq, Hashable, Binary, NFData)
+-- newtype FileRule = FileRule { fromFileRule :: FilePath -> Maybe (Action ())) }
+-- newtype ModTime = ...
+-- getFileModtime :: FilePath -> Action ModTime
+-- getFileModtime file = ...
+--
+-- fileRule :: 'Rules' ()
+-- fileRule = 'addBuiltinRule' $ (\(File x) d dep = do
+--         d2 <- getFileModtime x
+--         let uptodate = d == Just d2 && not dep
+--         urule <- 'userRule' fromFileRule x
+--         case urule of
+--             Just act | not uptodate -> do
+--                 act
+--                 d3 <- getFileModtime x
+--                 return $ BuiltinResult (encode d3) () True (d == Just d3)
+--             _ -> return $ BuiltinResult (encode d2) () False (d == Just d2)
+-- @
+--
+--   This example instance means:
+--
+-- * A value of type @File@ uniquely identifies a file
+--
+-- * A user may add rules using the @FileRule@ type; they are executed if the modification
+--   time changed or was not stored in Shake's database, or if a dependency changed.
+--
+-- * Running the rule stores a 'ModTime' modification time but returns '()' from 'apply'
+--
+-- * Rules depending on this rule will re-run if the modification time changed from its stored value.
+--
+--   A simple build system can be created for the instance above with:
+--
+-- @
+-- -- Produce foo files using fooCC. For every output file \"filename.foo\" there must be an
+-- -- input file named \"filename\".
+-- compileFoo :: 'Rules' ()
+-- compileFoo = 'alternatives' $ do
+--     'addUserRule' (FileRule touch)
+--     'addUserRule' (FileRule compile)
+--     'action' ('apply' \"filename\")
+--     where
+--         compile :: FilePath -> Maybe ('Action' ())
+--         compile outputFile = when (takeExtension outputFile == \"foo\") . Just $ do
+--             -- figure out the name of the input file
+--             let inputFile = dropExtension outputFile
+--             'unit' $ 'apply' (File inputFile)
+--             'unit' $ 'Development.Shake.cmd' \"fooCC\" inputFile outputFile
+-- @
+--
+--   /Note:/ Dependencies between output and input files are /not/ expressed by
+--   rules, but instead by invocations of 'apply' within the rules.
+--   The timestamps of the files are only compared to themselves; Shake uses its
+--   own (logical) clock for tracking dependencies.
+--
+-- addBuiltinRule :: (ShakeValue key, ShakeValue value) => (key -> Maybe value -> Bool -> Action (BuiltinResult value)) -> Rules ()
+addBuiltinRule :: (Typeable key, Binary key, Binary vsto, Typeable vdyn) => (key -> Maybe vsto -> Bool -> Action (BuiltinResult vdyn)) -> Rules ()
+addBuiltinRule act = newRules mempty{rules = Map.singleton kt f}
+    where
+    kt = typeOf $ (undefined :: (key -> foo) -> key) act
+    f = BuiltinRule { execute = \k' vo' dep -> do
+        let k = fromKeyDef k' (err "addBuiltinRule: incorrect type")
+        let vo = fmap (decode . result) vo'
+        fmap toDyn <$> act k vo dep
+    }
+
+-- | A simplified built-in rule that runs on every Shake invocation, caches its value between runs, and uses Eq for equality.
+-- simpleCheck :: (ShakeValue key, ShakeValue value) => (key -> Action value) -> Rules ()
+simpleCheck act = addBuiltinRule $ \k vo _ -> do
+    v <- act k
+    return $ BuiltinResult (encode v) v True (maybe False ((==) v) vo)
+
+-- | The default user rule system, processing alternatives and priorities but disallowing multiple matching rules
+userRule :: (Show k, Typeable k, Typeable a) => (a -> k -> Maybe b) -> k -> Action (Maybe b)
+userRule from k = do
+    u <- getUserRules
+    case u of
+        Nothing -> return Nothing
+        Just u -> case userRuleMatch (fmap (($k) . from) u) of
+            [r]:_ -> return $ Just r
+            rs:_  -> liftIO $ errorMultipleRulesMatch (typeOf k) (Just $ show k) (length rs)
+            []    -> return Nothing
+
 -- | Internal main function (not exported publicly)
 run :: ShakeOptions -> Rules () -> IO ()
 run opts@ShakeOptions{..} rs = (if shakeLineBuffering then lineBuffering else id) $ do
     opts@ShakeOptions{..} <- if shakeThreads /= 0 then return opts else do p <- getProcessorCount; return opts{shakeThreads=p}
-
     start <- offsetTime
     (actions, ruleinfo) <- runRules opts rs
 
@@ -65,10 +166,9 @@ run opts@ShakeOptions{..} rs = (if shakeLineBuffering then lineBuffering else id
         lock <- newLock
         return $ \v msg -> withLock lock $ shakeOutput v msg
 
-    let diagnostic | shakeVerbosity < Diagnostic = const $ return ()
-                   | otherwise = \act -> do v <- act; outputLocked Diagnostic $ "% " ++ v
+    let diagnostic = if shakeVerbosity >= Diagnostic then outputLocked Diagnostic . ("% "++) else const $ return ()
     let output v = outputLocked v . abbreviate shakeAbbreviations
-    diagnostic $ return "Starting run"
+    diagnostic "Starting run"
 
     except <- newIORef (Nothing :: Maybe (String, ShakeException))
     let raiseError err
@@ -78,9 +178,10 @@ run opts@ShakeOptions{..} rs = (if shakeLineBuffering then lineBuffering else id
                 atomicModifyIORef except $ \v -> (Just $ fromMaybe (named err, err) v, ())
                 -- no need to print exceptions here, they get printed when they are wrapped
 
-    lint <- if isNothing shakeLint then return $ const $ return () else do
+    lint <- if shakeLint == LintNothing then return $ const $ return () else do
         dir <- getCurrentDirectory
         return $ \msg -> do
+            diagnostic msg
             now <- getCurrentDirectory
             when (dir /= now) $ errorStructured
                 "Lint checking error - current directory has changed"
@@ -88,7 +189,7 @@ run opts@ShakeOptions{..} rs = (if shakeLineBuffering then lineBuffering else id
                 ,("Wanted",Just dir)
                 ,("Got",Just now)]
                 ""
-    diagnostic $ return "Starting run 2"
+    diagnostic "Starting run 2"
 
     after <- newIORef []
     absent <- newIORef []
@@ -97,7 +198,7 @@ run opts@ShakeOptions{..} rs = (if shakeLineBuffering then lineBuffering else id
             when shakeTimings printTimings
             resetTimings -- so we don't leak memory
         withNumCapabilities shakeThreads $ do
-            diagnostic $ return "Starting run 3"
+            diagnostic "Starting run 3"
             withDatabase opts diagnostic $ \database -> do
                 wait <- newBarrier
                 let getProgress = do
@@ -112,22 +213,41 @@ run opts@ShakeOptions{..} rs = (if shakeLineBuffering then lineBuffering else id
 
                 addTiming "Running rules"
                 runPool (shakeThreads == 1) shakeThreads $ \pool -> do
-                    let s0 = Global database pool cleanup start ruleinfo output opts diagnostic lint after absent getProgress
-                    let s1 = newLocal emptyStack shakeVerbosity
-                    forM_ actions $ \act ->
-                        addPoolLowPriority pool $ runAction s0 s1 act $ \x -> case x of
+                    let s0 = Global database pool cleanup start (rules rs) (userrules rs) output opts diagnostic lint after absent getProgress
+                    let s1 = Local emptyStack shakeVerbosity Nothing mempty 0 [] [] []
+                    forM_ (actions rs) $ \act ->
+                        addPool pool $ runAction s0 s1 act $ \x -> case x of
                             Left e -> raiseError =<< shakeException s0 (return ["Top-level action/want"]) e
                             Right x -> return x
                 maybe (return ()) (throwIO . snd) =<< readIORef except
                 assertFinishedDatabase database
 
-                when (null actions) $
+                when (null $ actions rs) $
                     when (shakeVerbosity >= Normal) $ output Normal "Warning: No want/action statements, nothing to do"
 
-                when (isJust shakeLint) $ do
+                when (basicLint shakeLint) $ do
                     addTiming "Lint checking"
-                    absent <- readIORef absent
-                    checkValid database (runStored ruleinfo) (runEqual ruleinfo) absent
+                    absent' <- readIORef absent
+                    checkValid database absent' $ \ks -> do
+                        bad <- newIORef []
+                        runPool (shakeThreads == 1) shakeThreads $ \pool -> do
+                            let opts2 = opts{shakeRunCommands=RunMinimal}
+                            let s0 = Global database pool cleanup start (rules rs) (userrules rs) output opts2 diagnostic lint after absent getProgress
+                            forM_ ks $ \(i,(key,v)) -> case v of
+                                Ready ro -> do
+                                    let reply = undefined
+--                                         reply (Error e) = raiseError =<< shakeException s0 (return ["Lint-checking"]) e
+--                                         reply (Ready r) = do
+--                                             let now = built r == changed r
+--                                             diagnostic $ "Checking if " ++ show key ++ " is " ++ show (result ro) ++ ", " ++ if now then "passed" else "FAILED"
+--                                             whenJust now $ \now -> modifyIORef' bad ((key, result ro, now):)
+                                    runKey_
+                                        s0 i key (Just $ resultStore ro) False
+                                        emptyStack
+                                        (incStep $ built $ resultStore ro)
+                                        reply
+                        maybe (return ()) (throwIO . snd) =<< readIORef except
+                        readIORef bad
                     when (shakeVerbosity >= Loud) $ output Loud "Lint checking succeeded"
                 when (shakeReport /= []) $ do
                     addTiming "Profile report"
@@ -138,116 +258,99 @@ run opts@ShakeOptions{..} rs = (if shakeLineBuffering then lineBuffering else id
                         writeProfile file report
                 when (shakeLiveFiles /= []) $ do
                     addTiming "Listing live"
-                    live <- listLive database
-                    let liveFiles = [show k | k <- live, specialIsFileKey $ typeKey k]
-                    forM_ shakeLiveFiles $ \file -> do
-                        when (shakeVerbosity >= Normal) $
-                            output Normal $ "Writing live list to " ++ file
-                        (if file == "-" then putStr else writeFile file) $ unlines liveFiles
+                    -- TODO: actual pruning
+--                     live <- listLive database
+--                     let liveFiles = [show k | k <- live, specialIsFileKey $ typeKey k]
+--                     forM_ shakeLiveFiles $ \file -> do
+--                         when (shakeVerbosity >= Normal) $
+--                             output Normal $ "Writing live list to " ++ file
+--                         (if file == "-" then putStr else writeFile file) $ unlines liveFiles
             sequence_ . reverse =<< readIORef after
-
 
 lineBuffering :: IO a -> IO a
 lineBuffering = withBuffering stdout LineBuffering . withBuffering stderr LineBuffering
 
-
-abbreviate :: [(String,String)] -> String -> String
-abbreviate [] = id
-abbreviate abbrev = f
-    where
-        -- order so longer abbreviations are preferred
-        ordAbbrev = sortOn (negate . length . fst) abbrev
-
-        f [] = []
-        f x | (to,rest):_ <- [(to,rest) | (from,to) <- ordAbbrev, Just rest <- [stripPrefix from x]] = to ++ f rest
-        f (x:xs) = x : f xs
-
+-- | Whether to do basic lint checks
+basicLint :: Lint -> Bool
+basicLint = (/= LintNothing)
 
 -- | Execute a rule, returning the associated values. If possible, the rules will be run in parallel.
---   This function requires that appropriate rules have been added with 'addUserRule'.
+--   This function requires that appropriate rules have been added with 'rule'.
 --   All @key@ values passed to 'apply' become dependencies of the 'Action'.
 apply :: (ShakeValue key, ShakeValue value) => [key] -> Action [value]
 apply = applyForall
+
+-- | Return the values associated with an already-executed rule, throwing an error if the
+--   rule would need to be re-run.
+--   This function requires that appropriate rules have been added with 'rule'.
+--   All @key@ values passed to 'applied' become dependencies of the 'Action'.
+applied :: (ShakeValue key, ShakeValue value) => [key] -> Action [value]
+applied ks = blockApply "'applied' key" (applyForall ks)
 
 -- We don't want the forall in the Haddock docs
 -- Don't short-circuit [] as we still want error messages
 applyForall :: forall key value . (ShakeValue key, ShakeValue value) => [key] -> Action [value]
 applyForall ks = do
-    let tk = typeRep (Proxy :: Proxy key)
-        tv = typeRep (Proxy :: Proxy value)
+    let tk = typeOf (err "apply key" :: key)
+        tv = typeOf (err "apply type" :: value)
     Global{..} <- Action getRO
-    block <- Action $ getsRW localBlockApply
-    whenJust block $ liftIO . errorNoApply tk (show <$> listToMaybe ks)
+    -- this duplicates the check in runKey, but we can give better error messages here
     case Map.lookup tk globalRules of
         Nothing -> liftIO $ errorNoRuleToBuildType tk (show <$> listToMaybe ks) (Just tv)
-        Just RuleInfo{resultType=tv2} | tv /= tv2 -> liftIO $ errorRuleTypeMismatch tk (show <$> listToMaybe ks) tv2 tv
-        _ -> fmap (map fromValue) $ applyKeyValue $ map newKey ks
+        _ -> return ()
+    vs <- applyKeyValue (map newKey ks)
+    let f k (resultValue -> v) = case fromDynamic v of
+            Just v -> return v
+            Nothing -> liftIO $ errorRuleTypeMismatch tk (Just $ show k) (dynTypeRep v) tv
+    zipWithM f ks vs
 
-
-applyKeyValue :: [Key] -> Action [Value]
+-- | The monomorphic function underlying 'apply', for those who need it
+applyKeyValue :: [Key] -> Action [LiveResult]
 applyKeyValue [] = return []
 applyKeyValue ks = do
     global@Global{..} <- Action getRO
-    let exec stack k continue = do
-            let s = newLocal stack (shakeVerbosity globalOptions)
-            let top = showTopStack stack
-            time <- offsetTime
-            runAction global s (do
+    stack <- Action $ getsRW localStack
+    block <- Action $ getsRW localBlockApply
+    (dur, dep, vs) <- Action $ captureRAW $ build globalPool globalDatabase (Ops (runKey_ global)) stack block ks
+    Action $ modifyRW $ \s -> s{localDiscount=localDiscount s + dur, localDepends=dep <> localDepends s}
+    return vs
+
+runKey_ :: Global -> Id -> Key -> Maybe Result -> Bool -> Stack -> Step -> Capture Status
+runKey_ global@Global{..} i k r deps stack step continue = do
+    time <- offsetTime
+    let s = Local stack (shakeVerbosity globalOptions) Nothing mempty 0 [] [] []
+    let top = showTopStack stack
+    runAction global s (do
+        let tk = typeKey k
+        case Map.lookup tk globalRules of
+            Nothing -> liftIO $ errorNoRuleToBuildType tk (Just $ show k) Nothing
+            Just BuiltinRule{..} -> do
                 liftIO $ evaluate $ rnf k
                 liftIO $ globalLint $ "before building " ++ top
                 putWhen Chatty $ "# " ++ show k
-                res <- runExecute globalRules k
-                when (Just LintFSATrace == shakeLint globalOptions) trackCheckUsed
-                Action $ fmap ((,) res) getRW) $ \x -> case x of
-                    Left e -> continue . Left . toException =<< shakeException global (showStack globalDatabase stack) e
-                    Right (res, Local{..}) -> do
-                        dur <- time
-                        globalLint $ "after building " ++ top
-                        let ans = (res, reverse localDepends, dur - localDiscount, reverse localTraces)
-                        evaluate $ rnf ans
-                        continue $ Right ans
-    stack <- Action $ getsRW localStack
-    (dur, dep, vs) <- Action $ captureRAW $ build globalPool globalDatabase (Ops (runStored globalRules) (runEqual globalRules) exec) stack ks
-    Action $ modifyRW $ \s -> s{localDiscount=localDiscount s + dur, localDepends=dep : localDepends s}
-    return vs
-
-
-
-runStored :: Map.HashMap TypeRep RuleInfo -> Key -> IO (Maybe Value)
-runStored mp k = case Map.lookup (typeKey k) mp of
-    Nothing -> return Nothing
-    Just RuleInfo{..} -> stored k
-
-runEqual :: Map.HashMap TypeRep RuleInfo -> Key -> Value -> Value -> EqualCost
-runEqual mp k v1 v2 = case Map.lookup (typeKey k) mp of
-    Nothing -> NotEqual
-    Just RuleInfo{..} -> equal k v1 v2
-
-runExecute :: Map.HashMap TypeRep RuleInfo -> Key -> Action Value
-runExecute mp k = let tk = typeKey k in case Map.lookup tk mp of
-    Nothing -> liftIO $ errorNoRuleToBuildType tk (Just $ show k) Nothing
-    Just RuleInfo{..} -> execute k
-
-
--- | Turn a normal exception into a ShakeException, giving it a stack and printing it out if in staunch mode.
---   If the exception is already a ShakeException (e.g. it's a child of ours who failed and we are rethrowing)
---   then do nothing with it.
-shakeException :: Global -> IO [String] -> SomeException -> IO ShakeException
-shakeException Global{globalOptions=ShakeOptions{..},..} stk e@(SomeException inner) = case cast inner of
-    Just e@ShakeException{} -> return e
-    Nothing -> do
-        stk <- stk
-        e <- return $ ShakeException (last $ "Unknown call stack" : stk) stk e
-        when (shakeStaunch && shakeVerbosity >= Quiet) $
-            globalOutput Quiet $ show e ++ "Continuing due to staunch mode"
-        return e
-
-
--- | Apply a single rule, equivalent to calling 'apply' with a singleton list. Where possible,
---   use 'apply' to allow parallelism.
-apply1 :: (ShakeValue key, ShakeValue value) => key -> Action value
-apply1 = fmap head . apply . return
-
+                let r' = if shakeRead globalOptions then r else Nothing
+                BuiltinResult{..} <- execute k r' deps
+                when (LintFSATrace == shakeLint globalOptions) trackCheckUsed
+                liftIO $ globalLint $ "after building " ++ top
+                dur <- liftIO time
+                Local{..} <- Action $ getRW
+                let ldeps = finalizeDepends localDepends
+                let ans = LiveResult
+                          { resultValue = resultValueB
+                          , resultStore = Result
+                            { result = resultStoreB
+                            , depends = if ranDependsB then ldeps else maybe ldeps depends r
+                            , changed = if unchangedB then maybe step changed r else step
+                            , built = step
+                            , execution = doubleToFloat $ dur - localDiscount
+                            }
+                          , traces = reverse localTraces
+                          }
+                liftIO $ evaluate $ rnf ans
+                return ans
+                ) $ \x -> case x of
+                    Left e -> continue . Error . toException =<< shakeException global (showStack globalDatabase stack) e
+                    Right r -> continue $ Ready r
 
 ---------------------------------------------------------------------
 -- TRACKING
@@ -260,27 +363,28 @@ trackUse :: ShakeValue key => key -> Action ()
 -- 3) someone explicitly gave you permission with trackAllow
 -- 4) at the end of the rule, a) you are now on the dependency list, and b) this key itself has no dependencies (is source file)
 trackUse key = do
-    let k = newKey key
     Global{..} <- Action getRO
     l@Local{..} <- Action getRW
-    deps <- liftIO $ concatMapM (listDepends globalDatabase) localDepends
-    let top = topStack localStack
-    if top == Just k then
-        return () -- condition 1
-     else if k `elem` deps then
-        return () -- condition 2
-     else if any ($ k) localTrackAllows then
-        return () -- condition 3
-     else
-        Action $ putRW l{localTrackUsed = k : localTrackUsed} -- condition 4
+    when (basicLint $ shakeLint globalOptions) $ do
+        let k = newKey key
+        deps <- liftIO $ listDepends globalDatabase localDepends
+        let top = topStack localStack
+        if top == Just k then
+            return () -- condition 1
+        else if k `elem` deps then
+            return () -- condition 2
+        else if any ($ k) localTrackAllows then
+            return () -- condition 3
+        else
+            Action $ putRW l{localTrackUsed = k : localTrackUsed} -- condition 4
 
 
 trackCheckUsed :: Action ()
 trackCheckUsed = do
     Global{..} <- Action getRO
     Local{..} <- Action getRW
-    liftIO $ do
-        deps <- concatMapM (listDepends globalDatabase) localDepends
+    when (basicLint $ shakeLint globalOptions) $ liftIO $ do
+        deps <- listDepends globalDatabase localDepends
 
         -- check 3a
         bad <- return $ localTrackUsed \\ deps
@@ -311,7 +415,7 @@ trackChange key = do
     let k = newKey key
     Global{..} <- Action getRO
     Local{..} <- Action getRW
-    liftIO $ do
+    when (basicLint $ shakeLint globalOptions) $ liftIO $ do
         let top = topStack localStack
         if top == Just k then
             return () -- condition 1
@@ -324,11 +428,16 @@ trackChange key = do
 
 -- | Allow any matching key to violate the tracking rules.
 trackAllow :: ShakeValue key => (key -> Bool) -> Action ()
-trackAllow (test :: key -> Bool) = Action $ modifyRW $ \s -> s{localTrackAllows = f : localTrackAllows s}
-    where
-        tk = typeRep (Proxy :: Proxy key)
-        f k = typeKey k == tk && test (fromKey k)
+trackAllow = trackAllowForall
 
+-- We don't want the forall in the Haddock docs
+trackAllowForall :: forall key . ShakeValue key => (key -> Bool) -> Action ()
+trackAllowForall test = do
+    Global{..} <- Action getRO
+    when (basicLint $ shakeLint globalOptions) $ Action $ modifyRW $ \s -> s{localTrackAllows = f : localTrackAllows s}
+    where
+        tk = typeOf (err "trackAllow key" :: key)
+        f k = typeKey k == tk && fmap test (fromKey k) == Just True
 
 ---------------------------------------------------------------------
 -- RESOURCES
@@ -398,24 +507,22 @@ newResource name mx = liftIO $ newResourceIO name mx
 newThrottle :: String -> Int -> Double -> Rules Resource
 newThrottle name count period = liftIO $ newThrottleIO name count period
 
-
 -- | Run an action which uses part of a finite resource. For more details see 'Resource'.
 --   You cannot depend on a rule (e.g. 'need') while a resource is held.
 withResource :: Resource -> Int -> Action a -> Action a
 withResource r i act = do
     Global{..} <- Action getRO
-    liftIO $ globalDiagnostic $ return $ show r ++ " waiting to acquire " ++ show i
+    liftIO $ globalDiagnostic $ show r ++ " waiting to acquire " ++ show i
     offset <- liftIO offsetTime
     Action $ captureRAW $ \continue -> acquireResource r globalPool i $ continue $ Right ()
     res <- Action $ tryRAW $ fromAction $ blockApply ("Within withResource using " ++ show r) $ do
         offset <- liftIO offset
-        liftIO $ globalDiagnostic $ return $ show r ++ " acquired " ++ show i ++ " in " ++ showDuration offset
+        liftIO $ globalDiagnostic $ show r ++ " acquired " ++ show i ++ " in " ++ showDuration offset
         Action $ modifyRW $ \s -> s{localDiscount = localDiscount s + offset}
         act
     liftIO $ releaseResource r globalPool i
-    liftIO $ globalDiagnostic $ return $ show r ++ " released " ++ show i
+    liftIO $ globalDiagnostic $ show r ++ " released " ++ show i
     Action $ either throwRAW return res
-
 
 -- | Run an action which uses part of several finite resources. Acquires the resources in a stable
 --   order, to prevent deadlock. If all rules requiring more than one resource acquire those
@@ -444,11 +551,11 @@ newCacheIO act = do
                         pool <- Action $ getsRO globalPool
                         offset <- liftIO offsetTime
                         Action $ captureRAW $ \k -> waitFence bar $ \v ->
-                            addPoolMediumPriority pool $ do offset <- liftIO offset; k $ Right (v,offset)
+                            addPool pool $ do offset <- liftIO offset; k $ Right (v,offset)
                 case res of
                     Left err -> Action $ throwRAW err
                     Right (deps,v) -> do
-                        Action $ modifyRW $ \s -> s{localDepends = deps ++ localDepends s, localDiscount = localDiscount s + offset}
+                        Action $ modifyRW $ \s -> s{localDepends = deps <> localDepends s, localDiscount = localDiscount s + offset}
                         return v
             Nothing -> do
                 bar <- newFence
@@ -461,7 +568,7 @@ newCacheIO act = do
                             Action $ throwRAW err
                         Right v -> do
                             post <- Action $ getsRW localDepends
-                            let deps = take (length post - length pre) post
+                            let deps = subtractDepends pre post
                             liftIO $ signalFence bar $ Right (deps, v)
                             return v
 
@@ -529,13 +636,3 @@ parallel acts = Action $ do
                     Nothing -> return Nothing
                     Just i | i == 1 || isLeft res -> do resume; return Nothing
                     Just i -> return $ Just $ i - 1
-
-
--- | Run an action but do not depend on anything the action uses.
---   A more general version of 'orderOnly'.
-orderOnlyAction :: Action a -> Action a
-orderOnlyAction act = Action $ do
-    pre <- getsRW localDepends
-    res <- fromAction act
-    modifyRW $ \s -> s{localDepends=pre}
-    return res

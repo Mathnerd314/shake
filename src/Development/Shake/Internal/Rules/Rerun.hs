@@ -1,23 +1,18 @@
 {-# LANGUAGE MultiParamTypeClasses, GeneralizedNewtypeDeriving, DeriveDataTypeable, ScopedTypeVariables #-}
 
 module Development.Shake.Internal.Rules.Rerun(
-    defaultRuleRerun, alwaysRerun
+    defaultRuleRerun, alwaysRerun, outputCheck
     ) where
 
 import Development.Shake.Internal.Core.Run
 import Development.Shake.Internal.Core.Rules
 import Development.Shake.Classes
+import Development.Shake.Types
 
+import qualified Data.ByteString.Lazy as LBS
 
 newtype AlwaysRerunQ = AlwaysRerunQ ()
-    deriving (Typeable,Eq,Hashable,Binary,NFData)
-instance Show AlwaysRerunQ where show _ = "alwaysRerun"
-
-newtype AlwaysRerunA = AlwaysRerunA ()
-    deriving (Typeable,Hashable,Binary,NFData)
-instance Show AlwaysRerunA where show _ = "<none>"
-instance Eq AlwaysRerunA where a == b = False
-
+    deriving (Typeable,Eq,Hashable,Binary,NFData,Show)
 
 -- | Always rerun the associated action. Useful for defining rules that query
 --   the environment. For example:
@@ -34,10 +29,22 @@ instance Eq AlwaysRerunA where a == b = False
 --   Note that 'alwaysRerun' is applied when a rule is executed. Modifying an existing rule
 --   to insert 'alwaysRerun' will /not/ cause that rule to rerun next time.
 alwaysRerun :: Action ()
-alwaysRerun = do AlwaysRerunA _ <- apply1 $ AlwaysRerunQ (); return ()
+alwaysRerun = apply1 $ AlwaysRerunQ ()
 
 defaultRuleRerun :: Rules ()
 defaultRuleRerun = do
-    addBuiltinRule defaultBuiltinRule
-        {storedValue = \_ AlwaysRerunQ{} -> return (Nothing :: Maybe AlwaysRerunA)
-        ,executeRule = \_ AlwaysRerunQ{} -> return $ AlwaysRerunA ()}
+    simpleCheck (\OutputCheck{} -> fmap shakeOutputCheck getShakeOptions)
+    addBuiltinRule $ \AlwaysRerunQ{} (_ :: Maybe ()) _ -> do
+        return $ BuiltinResult
+            { resultStoreB = LBS.empty
+            , resultValueB = ()
+            , ranDependsB = True
+            , unchangedB = False
+            }
+
+newtype OutputCheck = OutputCheck ()
+    deriving (Typeable,Eq,Hashable,Binary,NFData,Show)
+
+-- | A tracking version of 'shakeOutputCheck' that will re-run all relevant rules when it changes.
+outputCheck :: Action Bool
+outputCheck = apply1 (OutputCheck ())

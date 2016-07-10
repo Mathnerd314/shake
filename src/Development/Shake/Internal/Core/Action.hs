@@ -42,42 +42,49 @@ import Prelude
 newtype Action a = Action {fromAction :: RAW Global Local a}
     deriving (Functor, Applicative, Monad, MonadIO, Typeable)
 
-data RuleInfo = RuleInfo
-    {stored :: Key -> IO (Maybe Value)
-    ,equal :: Key -> Value -> Value -> EqualCost
-    ,execute :: Key -> Action Value
-    ,resultType :: TypeRep
-    }
+data BuiltinResult value = BuiltinResult
+    { resultStoreB :: Builder -- ^ the associated store result
+    , resultValueB :: value -- ^ dynamic return value limited to lifetime of the program
+    , ranDependsB :: Bool -- ^ whether the dependencies for this rule were 'apply'-d
+    , unchangedB :: Bool -- ^ whether the value is the same, so that there is no need to run reverse dependencies
+    } deriving (Typeable, Functor)
+
+data BuiltinRule_ = BuiltinRule_ (Key -- ^ Key that you want to build.
+                               -> Maybe Result -- ^ the previous result in the database, if any
+                               -> Bool -- ^ 'True' if any dependency has changed, or if Shake has no memory of this rule.
+                               -> Action (BuiltinResult Dynamic) -- ^ result of executing the rule
+                                 )
 
 -- global constants of Action
 data Global = Global
-    {globalDatabase :: Database -- ^ Database, contains knowledge of the state of each key
-    ,globalPool :: Pool -- ^ Pool, for queuing new elements
-    ,globalCleanup :: Cleanup -- ^ Cleanup operations
-    ,globalTimestamp :: IO Seconds -- ^ Clock saying how many seconds through the build
-    ,globalRules :: Map.HashMap TypeRep RuleInfo -- ^ Rules for this build
-    ,globalOutput :: Verbosity -> String -> IO () -- ^ Output function
-    ,globalOptions  :: ShakeOptions -- ^ Shake options
-    ,globalDiagnostic :: IO String -> IO () -- ^ Debugging function
-    ,globalLint :: String -> IO () -- ^ Run lint checking
-    ,globalAfter :: IORef [IO ()] -- ^ Operations to run on success, e.g. removeFilesAfter
-    ,globalTrackAbsent :: IORef [(Key, Key)] -- ^ Tracked things, in rule fst, snd must be absent
-    ,globalProgress :: IO Progress -- ^ Request current progress state
+    {globalDatabase :: Database
+    ,globalPool :: Pool
+    ,globalCleanup :: Cleanup
+    ,globalTimestamp :: IO Seconds
+    ,globalRules :: Map.HashMap TypeRep (BuiltinRule Action)
+    ,globalUserRules :: Map.HashMap TypeRep RuleSet
+    ,globalOutput :: Verbosity -> String -> IO ()
+    ,globalOptions  :: ShakeOptions
+    ,globalDiagnostic :: String -> IO ()
+    ,globalLint :: String -> IO ()
+    ,globalAfter :: IORef [IO ()]
+    ,globalTrackAbsent :: IORef [(Key, Key)] -- in rule fst, snd must be absent
+    ,globalProgress :: IO Progress
     }
 
 -- local variables of Action
 data Local = Local
     -- constants
-    {localStack :: Stack -- ^ The stack that ran to get here.
+    {localStack :: Stack
     -- stack scoped local variables
-    ,localVerbosity :: Verbosity -- ^ Verbosity, may be changed locally
-    ,localBlockApply ::  Maybe String -- ^ Reason to block apply, or Nothing to allow
+    ,localVerbosity :: Verbosity
+    ,localBlockApply ::  Maybe String -- reason to block apply, or Nothing to allow
     -- mutable local variables
-    ,localDepends :: [Depends] -- ^ Dependencies, built up in reverse
-    ,localDiscount :: !Seconds -- ^ Time spend building dependencies
-    ,localTraces :: [Trace] -- ^ Traces, built in reverse
-    ,localTrackAllows :: [Key -> Bool] -- ^ Things that are allowed to be used
-    ,localTrackUsed :: [Key] -- ^ Things that have been used
+    ,localDepends :: Depends -- built up in reverse
+    ,localDiscount :: !Seconds
+    ,localTraces :: [Trace] -- in reverse
+    ,localTrackAllows :: [Key -> Bool]
+    ,localTrackUsed :: [Key]
     }
 
 newLocal :: Stack -> Verbosity -> Local
@@ -93,6 +100,19 @@ runAction g l (Action x) = runRAW g l x
 
 ---------------------------------------------------------------------
 -- EXCEPTION HANDLING
+
+-- | Turn a normal exception into a ShakeException, giving it a stack and printing it out if in staunch mode.
+--   If the exception is already a ShakeException (e.g. it's a child of ours who failed and we are rethrowing)
+--   then do nothing with it.
+shakeException :: Global -> IO [String] -> SomeException -> IO ShakeException
+shakeException Global{globalOptions=ShakeOptions{..},..} stk e@(SomeException inner) = case cast inner of
+    Just e@ShakeException{} -> return e
+    Nothing -> do
+        stk <- stk
+        e <- return $ ShakeException (last $ "Unknown call stack" : stk) stk e
+        when (shakeStaunch && shakeVerbosity >= Quiet) $
+            globalOutput Quiet $ show e ++ "Continuing due to staunch mode"
+        return e
 
 actionBoom :: Bool -> Action a -> IO b -> Action a
 actionBoom runOnSuccess act clean = do
@@ -141,7 +161,6 @@ putWhen v msg = do
     when (verb >= v) $
         liftIO $ globalOutput v msg
 
-
 -- | Write an unimportant message to the output, only shown when 'shakeVerbosity' is higher than normal ('Loud' or above).
 --   The output will not be interleaved with any other Shake messages (other than those generated by system commands).
 putLoud :: String -> Action ()
@@ -165,14 +184,12 @@ putQuiet = putWhen Quiet
 getVerbosity :: Action Verbosity
 getVerbosity = Action $ getsRW localVerbosity
 
-
 -- | Run an action with a particular verbosity level.
 --   Will not update the 'shakeVerbosity' returned by 'getShakeOptions' and will
 --   not have any impact on 'Diagnostic' tracing.
 withVerbosity :: Verbosity -> Action a -> Action a
 withVerbosity new = Action . unmodifyRW f . fromAction
     where f s0 = (s0{localVerbosity=new}, \s -> s{localVerbosity=localVerbosity s0})
-
 
 -- | Run an action with 'Quiet' verbosity, in particular messages produced by 'traced'
 --   (including from 'Development.Shake.cmd' or 'Development.Shake.command') will not be printed to the screen.
@@ -181,9 +198,8 @@ withVerbosity new = Action . unmodifyRW f . fromAction
 quietly :: Action a -> Action a
 quietly = withVerbosity Quiet
 
-
 ---------------------------------------------------------------------
--- BLOCK APPLY
+-- Messing with apply
 
 unsafeAllowApply :: Action a -> Action a
 unsafeAllowApply  = applyBlockedBy Nothing
@@ -195,6 +211,14 @@ applyBlockedBy :: Maybe String -> Action a -> Action a
 applyBlockedBy reason = Action . unmodifyRW f . fromAction
     where f s0 = (s0{localBlockApply=reason}, \s -> s{localBlockApply=localBlockApply s0})
 
+-- | Run an action but do not depend on anything the action uses.
+--   A more general version of 'orderOnly'.
+orderOnlyAction :: Action a -> Action a
+orderOnlyAction act = Action $ do
+    pre <- getsRW localDepends
+    res <- fromAction act
+    modifyRW $ \s -> s{localDepends=pre}
+    return res
 
 ---------------------------------------------------------------------
 -- TRACING
@@ -211,12 +235,15 @@ applyBlockedBy reason = Action . unmodifyRW f . fromAction
 --   To suppress the output of 'traced' (for example you want more control
 --   over the message using 'putNormal'), use the 'quietly' combinator.
 traced :: String -> IO a -> Action a
-traced msg act = do
+traced s a = traced' s (liftIO a)
+
+traced' :: String -> Action a -> Action a
+traced' msg act = do
     Global{..} <- Action getRO
     stack <- Action $ getsRW localStack
     start <- liftIO globalTimestamp
     putNormal $ "# " ++ msg ++ " (for " ++ showTopStack stack ++ ")"
-    res <- liftIO act
+    res <- act
     stop <- liftIO globalTimestamp
     Action $ modifyRW $ \s -> s{localTraces = Trace (pack msg) (doubleToFloat start) (doubleToFloat stop) : localTraces s}
     return res

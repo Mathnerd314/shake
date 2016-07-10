@@ -20,8 +20,6 @@ import Data.Tuple.Extra
 import Control.Exception.Extra
 import Control.Monad.Extra
 import Control.Concurrent.Extra
-import Data.Binary.Get
-import Data.Binary.Put
 import Data.Time
 import Data.Char
 import Development.Shake.Classes
@@ -53,11 +51,11 @@ splitVersion abc = (a `LBS.append` b, c)
 
 
 withStorage
-    :: (Show v, Eq w, Binary w, BinaryWith w v)
+    :: (Eq w, Binary w)
     => ShakeOptions             -- ^ Storage options
     -> (IO String -> IO ())        -- ^ Logging function
     -> w                        -- ^ Witness
-    -> (Ids.Ids v -> (Id -> v -> IO ()) -> IO a)  -- ^ Execute
+    -> (Ids.Ids Value -> (Id -> Value -> IO ()) -> IO a)  -- ^ Execute
     -> IO a
 withStorage ShakeOptions{..} diagnostic witness act = withLockFileDiagnostic diagnostic (shakeFiles </> ".shake.lock") $ do
     let dbfile = shakeFiles </> ".shake.database"
@@ -73,7 +71,7 @@ withStorage ShakeOptions{..} diagnostic witness act = withLockFileDiagnostic dia
         renameFile bupfile dbfile
 
     addTiming "Database read"
-    withBinaryFile dbfile ReadWriteMode $ \h -> do
+    withBinaryFile dbfile (if shakeWrite then ReadWriteMode else ReadMode) $ \h -> do
         n <- hFileSize h
         diagnostic $ return $ "Reading file of size " ++ show n
         (oldVer,src) <- fmap splitVersion $ LBS.hGet h $ fromInteger n
@@ -98,7 +96,7 @@ withStorage ShakeOptions{..} diagnostic witness act = withLockFileDiagnostic dia
                     ("Error when reading Shake database " ++ dbfile) :
                     map ("  "++) (lines msg) ++
                     ["All files will be rebuilt"]
-                when shakeStorageLog $ do
+                when (shakeStorageLog && shakeWrite) $ do
                     hSeek h AbsoluteSeek 0
                     i <- hFileSize h
                     bs <- LBS.hGet h $ fromInteger i
@@ -119,7 +117,7 @@ withStorage ShakeOptions{..} diagnostic witness act = withLockFileDiagnostic dia
                         when (slop > 0) $ unexpected $ "Last " ++ show slop ++ " bytes do not form a whole record\n"
                         diagnostic $ return $ "Read " ++ show (length xs + 1) ++ " chunks, plus " ++ show slop ++ " slop"
                         let ws = decode w
-                            ents = map (runGet $ getWith ws) xs
+                            ents = map decode xs
                         mp <- Ids.empty
                         forM_ ents $ \(k,v) -> Ids.insert mp k v
 
@@ -140,7 +138,7 @@ withStorage ShakeOptions{..} diagnostic witness act = withLockFileDiagnostic dia
                         -- if mp is null, continue will reset it, so no need to clean up
                         if verEqual && (size == 0 || (ws == witness && size * 2 > length xs - 2)) then do
                             -- make sure we reset to before the slop
-                            when (size /= 0 && slop /= 0) $ do
+                            when (size /= 0 && slop /= 0 && shakeWrite) $ do
                                 diagnostic $ return $ "Dropping last " ++ show slop ++ " bytes of database (incomplete)"
                                 now <- hFileSize h
                                 hSetFileSize h $ now - slop
@@ -148,7 +146,8 @@ withStorage ShakeOptions{..} diagnostic witness act = withLockFileDiagnostic dia
                                 hFlush h
                                 diagnostic $ return "Drop complete"
                             return $ continue h mp
-                         else do
+                        else if not shakeWrite then return $ continue h mp
+                        else do
                             addTiming "Database compression"
                             unexpected "Compressing database\n"
                             diagnostic $ return "Compressing database"
@@ -182,18 +181,18 @@ withStorage ShakeOptions{..} diagnostic witness act = withLockFileDiagnostic dia
             hSeek h AbsoluteSeek 0
             LBS.hPut h ver
             writeChunk h $ encode witness
-            mapM_ (writeChunk h . runPut . putWith witness) =<< Ids.toList mp
+            mapM_ (writeChunk h . encode) $ Ids.toList mp
             hFlush h
             diagnostic $ return "Flush"
 
         -- continuation (since if we do a compress, h changes)
         continue h mp = do
-            whenM (Ids.null mp) $
+            whenM (Ids.null mp && shakeWrite) $
                 reset h mp -- might as well, no data to lose, and need to ensure a good witness table
                            -- also lets us recover in the case of corruption
-            flushThread shakeFlush h $ \out -> do
+            flushThread shakeWrite shakeFlush h $ \out -> do
                 addTiming "With database"
-                act mp $ \k v -> out $ toChunk $ runPut $ putWith witness (k, v)
+                act mp $ \k v -> out $ toChunk $ encode (k, v)
 
 
 withLockFileDiagnostic :: (IO String -> IO ()) -> FilePath -> IO a -> IO a
@@ -209,8 +208,9 @@ withLockFileDiagnostic diagnostic file act = do
 -- We avoid calling flush too often on SSD drives, as that can be slow
 -- Make sure all exceptions happen on the caller, so we don't have to move exceptions back
 -- Make sure we only write on one thread, otherwise async exceptions can cause partial writes
-flushThread :: Maybe Double -> Handle -> ((LBS.ByteString -> IO ()) -> IO a) -> IO a
-flushThread flush h act = do
+flushThread :: Bool -> Maybe Double -> Handle -> ((LBS.ByteString -> IO ()) -> IO a) -> IO a
+flushThread False _ h act = act (\s -> (evaluate $ LBS.length s) >> return ())
+flushThread True flush h act = do
     chan <- newChan -- operations to perform on the file
     kick <- newEmptyMVar -- kicked whenever something is written
     died <- newBarrier -- has the writing thread finished

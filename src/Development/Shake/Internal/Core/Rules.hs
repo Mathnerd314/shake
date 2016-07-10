@@ -111,7 +111,7 @@ import Prelude
 
 -- | TODO: Docs
 data BuiltinRule key value = BuiltinRule
-    {storedValue :: ShakeOptions -> key -> IO (Maybe value)
+    {storedValue :: ShakeOptions -> key -> IO value
         -- ^ /[Required]/ Retrieve the @value@ associated with a @key@, if available.
         --
         --   As an example for filenames/timestamps, if the file exists you should return 'Just'
@@ -124,7 +124,7 @@ data BuiltinRule key value = BuiltinRule
     }
 
 -- | Default 'equalValue' field.
-defaultBuiltinRule :: forall key value . (Typeable key, Typeable value, Show key, Eq value) => BuiltinRule key value
+defaultBuiltinRule :: forall key value . (Typeable key, Typeable value, Show key, Eq value) => BuiltinRule key (Maybe value)
 defaultBuiltinRule = BuiltinRule
     {storedValue = \_ _ -> return Nothing
     ,equalValue = \_ _ v1 v2 -> if v1 == v2 then EqualCheap else NotEqual
@@ -135,8 +135,6 @@ defaultBuiltinRule = BuiltinRule
                 rs  -> liftIO $ errorMultipleRulesMatch (typeRep (Proxy :: Proxy key)) (show k) (length rs)
     }
 
-
-data BuiltinRule_ = forall key value . (ShakeValue key, ShakeValue value) => BuiltinRule_ (BuiltinRule key value)
 
 data UserRule_ = forall a . Typeable a => UserRule_ (UserRule a)
 
@@ -153,26 +151,21 @@ data UserRule_ = forall a . Typeable a => UserRule_ (UserRule a)
 -- > unordered is associative and commutative
 -- > alternative does not obey priorities, until picking the best one
 data UserRule a
-    = UserRule a -- ^ Added to the state with @'addUserRule' :: Typeable a => a -> 'Rules' ()@.
-    | Unordered [UserRule a] -- ^ Rules combined with the 'Monad'/'Monoid'.
+    = UserRule a
+    | Unordered [UserRule a] -- ^ Added to the state with @'addUserRule' :: Typeable a => a -> Rules ()@.
     | Priority Double (UserRule a) -- ^ Rules defined under 'priority'.
-    | Alternative (UserRule a) -- ^ Rule defined under 'alternative', matched in order.
-      deriving (Eq,Show,Functor,Typeable)
+    | Alternative (UserRule a) -- ^ matched in order.
+      deriving (Eq,Show,Functor)
 
 -- | Rules might be able to be optimised in some cases
-userRuleMatch :: UserRule a -> (a -> Maybe b) -> [b]
-userRuleMatch u test = head $ (map snd $ reverse $ groupSort $ f Nothing $ fmap test u) ++ [[]]
+userRuleMatch :: UserRule (Maybe a) -> [a]
+userRuleMatch = head . map snd . reverse . groupSort . f
     where
-        f :: Maybe Double -> UserRule (Maybe a) -> [(Double,a)]
-        f p (UserRule x) = maybe [] (\x -> [(fromMaybe 1 p,x)]) x
-        f p (Unordered xs) = concatMap (f p) xs
-        f p (Priority p2 x) = f (Just $ fromMaybe p2 p) x
-        f p (Alternative x) = case f p x of
-            [] -> []
-            -- a bit weird to use the max priority but the first value
-            -- but that's what the current implementation does...
-            xs -> [(maximum $ map fst xs, snd $ head xs)]
-
+        f :: UserRule (Maybe a) -> [(Double,a)]
+        f (UserRule x) = maybe [] (\x -> [(1,x)]) x
+        f (Unordered xs) = concatMap f xs
+        f (Priority d x) = map (first $ const d) $ f x
+        f (Alternative x) = take 1 $ f x
 
 -- | Define a set of rules. Rules can be created with calls to functions such as 'Development.Shake.%>' or 'action'.
 --   Rules are combined with either the 'Monoid' instance, or (more commonly) the 'Monad' instance and @do@ notation.
@@ -192,6 +185,8 @@ runRules opts (Rules r) = do
     registerWitnesses srules
     return (actions srules, createRuleinfo opts srules)
 
+getRules :: Rules () -> IO (SRules Action)
+getRules (Rules r) = execWriterT r
 
 data SRules = SRules
     {actions :: [Action ()]

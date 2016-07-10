@@ -15,7 +15,6 @@ import qualified Data.HashSet as Set
 import qualified Data.HashMap.Strict as Map
 import System.Random
 
-
 ---------------------------------------------------------------------
 -- UNFAIR/RANDOM QUEUE
 
@@ -44,7 +43,6 @@ dequeue (Queue [] (Right t)) = do
     return $ case removeTree bs t of
         Nothing -> Nothing
         Just (x,t) -> Just (x, Queue [] $ Right t)
-
 
 ---------------------------------------------------------------------
 -- TREE
@@ -93,7 +91,6 @@ data S = S
 
 emptyS :: Int -> Bool -> S
 emptyS n deterministic = S Set.empty n 0 0 $ newQueue deterministic
-
 
 worker :: Pool -> IO ()
 worker pool@(Pool var done) = do

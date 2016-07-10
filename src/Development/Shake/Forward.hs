@@ -1,4 +1,4 @@
-{-# LANGUAGE GeneralizedNewtypeDeriving, DeriveDataTypeable, Rank2Types, ScopedTypeVariables, MultiParamTypeClasses #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving, DeriveDataTypeable, Rank2Types, RecordWildCards, ScopedTypeVariables, MultiParamTypeClasses #-}
 
 -- | A module for producing forward-defined build systems, in contrast to standard backwards-defined
 --   build systems such as shake. Based around ideas from <https://code.google.com/p/fabricate/ fabricate>.
@@ -38,31 +38,72 @@ module Development.Shake.Forward(
     ) where
 
 import Development.Shake
-import Development.Shake.Rule
+import Development.Shake.Internal.Core.Run
+import Development.Shake.Core2
+import Development.Shake.Internal.Core.Monad
 import Development.Shake.Command
 import Development.Shake.Classes
 import Development.Shake.FilePath
-import Data.IORef
+import Development.Shake.Internal.Value
+
+import Data.Binary
+import Data.Binary.Put
 import Data.Either
 import Data.List.Extra
 import Control.Exception.Extra
 import Numeric
-import System.IO.Unsafe
+import Data.IORef
 import qualified Data.HashMap.Strict as Map
 
+newtype ForwardQ = ForwardQ Value
+    deriving (Show,Typeable,Eq,Hashable,Binary,NFData)
 
-{-# NOINLINE forwards #-}
-forwards :: IORef (Map.HashMap ForwardQ (Action ()))
-forwards = unsafePerformIO $ newIORef Map.empty
+-{-# NOINLINE globalForwards #-}
+-- |
+globalForwards :: IORef (Map.HashMap Value (Action Value))
+globalForwards = unsafePerformIO $ newIORef Map.empty
 
-newtype ForwardQ = ForwardQ String
-    deriving (Hashable,Typeable,Eq,NFData,Binary)
+-- | Given an 'Action', turn it into a 'Rules' structure which runs in forward mode.
+forwardRule :: Action () -> Rules ()
+forwardRule act = do
+    liftIO $ registerWitness $ (undefined :: String)
+    addBuiltinRule $ \(ForwardQ k) vo dep -> do
+        res <- liftIO $ atomicModifyIORef globalForwards $ \mp -> (Map.delete k mp, Map.lookup k mp)
+        v <- case res of
+            Nothing -> liftIO . errorIO $ "Failed to find action: " ++ show k
+            _ | dep, Just vo <- vo -> return vo
+            Just act -> act
+        return $ BuiltinResult v v (not dep) $ maybe False ((==) v) vo
+    action act
 
-instance Show ForwardQ where
-    show (ForwardQ x) = x
-
-newtype ForwardA = ForwardA ()
-    deriving (Hashable,Typeable,Eq,NFData,Binary,Show)
+-- | Cache an action. The action's key must be globally unique over all runs (i.e., change if the code changes).
+--   The result is compared for equality using its 'Binary' serialization.
+--
+--   /If you use this function with a key type other than 'String', you must register it using 'registerWitness' before running Shake/
+--
+-- An example:
+--
+-- @
+-- import "Development.Shake"
+-- import "Development.Shake.Forward"
+-- import "Development.Shake.Value"
+--
+-- main = do
+--     'registerWitness' (undefined :: Integer)
+--     'shakeArgsForward' 'shakeOptions' $ do
+--         exists <- 'cacheAction' (0 :: Integer) $ 'doesFileExist' \"result.txt\"
+--         'cacheAction' (1 :: Integer) $ writeFile' \"result2.txt\" (show exists)
+-- @
+cacheAction :: (Typeable a, Binary a, Binary b) => a -> Action b -> Action b
+cacheAction name action = do
+    ws <- liftIO currentWitness
+    let key = runPut $ putKeyWith ws $ newKey name
+        act = fmap encode action
+    liftIO $ evaluate $ rnf key
+    liftIO $ atomicModifyIORef globalForwards $ \mp -> (Map.insert key act mp, ())
+    res <- fmap decode . apply1 $ ForwardQ key
+    liftIO $ atomicModifyIORef globalForwards $ \mp -> (Map.delete key mp, ()) -- needed?
+    return res
 
 -- | Run a forward-defined build system.
 shakeForward :: ShakeOptions -> Action () -> IO ()
@@ -72,32 +113,9 @@ shakeForward opts act = shake (forwardOptions opts) (forwardRule act)
 shakeArgsForward :: ShakeOptions -> Action () -> IO ()
 shakeArgsForward opts act = shakeArgs (forwardOptions opts) (forwardRule act)
 
--- | Given an 'Action', turn it into a 'Rules' structure which runs in forward mode.
-forwardRule :: Action () -> Rules ()
-forwardRule act = do
-    addBuiltinRule defaultBuiltinRule
-        {storedValue = \_ ForwardQ{} -> return $ Just $ ForwardA ()
-        ,executeRule = \_ k -> do
-            res <- liftIO $ atomicModifyIORef forwards $ \mp -> (Map.delete k mp, Map.lookup k mp)
-            case res of
-                Nothing -> liftIO $ errorIO "Failed to find action name"
-                Just act -> act
-            return $ ForwardA ()
-        }
-    action act
-
 -- | Given a 'ShakeOptions', set the options necessary to execute in forward mode.
 forwardOptions :: ShakeOptions -> ShakeOptions
 forwardOptions opts = opts{shakeCommandOptions=[AutoDeps]}
-
-
--- | Cache an action. The name of the action must be unique for all different actions.
-cacheAction :: String -> Action () -> Action ()
-cacheAction name action = do
-    let key = ForwardQ name
-    liftIO $ atomicModifyIORef forwards $ \mp -> (Map.insert key action mp, ())
-    _ :: [ForwardA] <- apply [key]
-    liftIO $ atomicModifyIORef forwards $ \mp -> (Map.delete key mp, ())
 
 -- | Apply caching to an external command.
 cache :: (forall r . CmdArguments r => r) -> Action ()

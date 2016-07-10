@@ -1,4 +1,4 @@
-{-# LANGUAGE ExistentialQuantification #-}
+{-# LANGUAGE ExistentialQuantification, InstanceSigs, ScopedTypeVariables #-}
 
 module Development.Shake.Internal.Core.Rendezvous(
     Waiting, newWaiting, afterWaiting,
@@ -10,6 +10,7 @@ import Control.Monad
 import Data.IORef.Extra
 import Data.Primitive.Array
 import Development.Shake.Internal.Errors
+import Data.Typeable
 
 
 -- | Given a sequence of 'Answer' values the sequence stops
@@ -17,8 +18,9 @@ import Development.Shake.Internal.Errors
 data Answer a c
     = Abort a
     | Continue c
+    | WaitAgain (Waiting (Answer a c))
 
--- | A compuation that either has a result available immediate,
+-- | A computation that either has a result available immediate,
 --   or has a result that can be collected later.
 data Compute a
     = Now a
@@ -42,8 +44,9 @@ data Waiting a = forall b . Waiting (b -> a) (IORef (b -> IO ()))
 instance Functor Waiting where
     fmap f (Waiting op ref) = Waiting (f . op) ref
 
-instance Show (Waiting a) where
-    show _ = "Waiting"
+instance Typeable a => Show (Waiting a) where
+    show :: forall a. Typeable a => Waiting a -> String
+    show _ = "Waiting " ++ show (typeOf (undefined :: a))
 
 
 newWaiting :: IO (Waiting a, a -> IO ())
@@ -54,7 +57,6 @@ newWaiting = do
 
 afterWaiting :: Waiting a -> (a -> IO ()) -> IO ()
 afterWaiting (Waiting op ref) act = modifyIORef' ref (\a s -> a s >> act (op s))
-
 
 rendezvous :: [Compute (Answer a c)] -> IO (Compute (Either a [c]))
 rendezvous xs = do
@@ -71,17 +73,20 @@ rendezvous xs = do
         todo <- newIORef $ length later
         forM_ (zip [0..] xs) $ \(i,x) -> case x of
             Now (Continue c) -> writeArray result i c
-            Later w -> afterWaiting w $ \v -> do
-                t <- readIORef todo
-                case v of
-                    _ | t == 0 -> return () -- must have already aborted
-                    Abort a -> do
-                        writeIORef todo 0
-                        run $ Left a
-                    Continue c -> do
-                        writeArray result i c
-                        writeIORef' todo $ t-1
-                        when (t == 1) $ do
-                            rs <- unsafeFreezeArray result
-                            run $ Right $ map (indexArray rs) [0..n-1]
+            Later w ->
+              let waitOn w = afterWaiting w $ \v -> do
+                    t <- readIORef todo
+                    case v of
+                        _ | t == 0 -> return () -- must have already aborted
+                        Abort a -> do
+                            writeIORef todo 0
+                            run $ Left a
+                        Continue c -> do
+                            writeArray result i c
+                            writeIORef' todo $ t-1
+                            when (t == 1) $ do
+                                rs <- unsafeFreezeArray result
+                                run $ Right $ map (indexArray rs) [0..n-1]
+                        WaitAgain kw -> waitOn kw
+              in waitOn w
         return $ Later waiting

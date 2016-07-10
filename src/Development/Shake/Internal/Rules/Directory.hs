@@ -113,24 +113,18 @@ instance Binary GetDirectoryQ where
 
 defaultRuleDirectory :: Rules ()
 defaultRuleDirectory = do
-    addBuiltinRule defaultBuiltinRule
-        {storedValue = \_ (DoesFileExistQ x) -> Just . DoesFileExistA <$> IO.doesFileExist x
-        ,executeRule = \_ (DoesFileExistQ x) -> liftIO $ DoesFileExistA <$> IO.doesFileExist x}
-    addBuiltinRule defaultBuiltinRule
-        {storedValue = \_ (DoesDirectoryExistQ x) -> Just . DoesDirectoryExistA <$> IO.doesDirectoryExist x
-        ,executeRule = \_ (DoesDirectoryExistQ x) -> liftIO $ DoesDirectoryExistA <$> IO.doesDirectoryExist x}
-    addBuiltinRule defaultBuiltinRule
-        {storedValue = \_ (GetEnvQ x) -> Just . GetEnvA <$> IO.lookupEnv x
-        ,executeRule = \_ (GetEnvQ x) -> liftIO $ GetEnvA <$> IO.lookupEnv x}
-    addBuiltinRule defaultBuiltinRule
-        {storedValue = \_ x -> Just <$> getDir x
-        ,executeRule = \_ x -> liftIO $ getDir x}
-
+    let sC :: (ShakeValue key, ShakeValue value) => (key -> IO value) -> Rules ()
+        sC = simpleCheck . (liftIO .)
+    sC $ \(DoesFileExistQ x) -> DoesFileExistA <$> IO.doesFileExist x
+    sC $ \(DoesDirectoryExistQ x) -> DoesDirectoryExistA <$> IO.doesDirectoryExist x
+    sC $ \(x :: GetDirectoryQ) -> getDir x
+    sC $ \(GetEnvQ x) -> GetEnvA <$> IO.lookupEnv x
 
 -- | Returns 'True' if the file exists. The existence of the file is tracked as a
 --   dependency, and if the file is created or deleted the rule will rerun in subsequent builds.
 --
---   You should not call 'doesFileExist' on files which can be created by the build system.
+--   You should not call 'doesFileExist' on files which can be created by the build system;
+--   instead, create a file rule and disable 'shakeCreationCheck' if the file might not be created.
 doesFileExist :: FilePath -> Action Bool
 doesFileExist file = do
     DoesFileExistA res <- apply1 $ DoesFileExistQ $ toStandard file
@@ -139,7 +133,8 @@ doesFileExist file = do
 -- | Returns 'True' if the directory exists. The existence of the directory is tracked as a
 --   dependency, and if the directory is created or delete the rule will rerun in subsequent builds.
 --
---   You should not call 'doesDirectoryExist' on directories which can be created by the build system.
+--   You should not call 'doesDirectoryExist' on directories which can be created by the build system;
+--   instead, create a directory rule and disable 'shakeCreationCheck' if the directory might not be created.
 doesDirectoryExist :: FilePath -> Action Bool
 doesDirectoryExist file = do
     DoesDirectoryExistA res <- apply1 $ DoesDirectoryExistQ $ toStandard file
@@ -198,19 +193,22 @@ getDirectoryContents x = getDirAction $ GetDir x
 -- > getDirectoryFiles "" ["Config//*.xml"]
 --
 --   If the first argument directory does not exist it will raise an error.
---   If @foo@ does not exist, then the first of these error, but the second will not.
+--   For example, if @foo@ does not exist, then the first of these error, but the second will not.
 --
 -- > getDirectoryFiles "foo" ["//*"] -- error
 -- > getDirectoryFiles "" ["foo//*"] -- returns []
 --
---   This function is tracked and serves as a dependency. If a rule calls
---   @getDirectoryFiles \"\" [\"*.c\"]@ and someone adds @foo.c@ to the
+--   If a rule calls  @getDirectoryFiles \"\" [\"*.c\"]@ and someone adds @foo.c@ to the
 --   directory, that rule will rebuild. If someone changes one of the @.c@ files,
---   but the /list/ of @.c@ files doesn't change, then it will not rebuild.
---   As a consequence of being tracked, if the contents change during the build
---   (e.g. you are generating @.c@ files in this directory) then the build not reach
---   a stable point, which is an error - detected by running with @--lint@.
---   You should only call this function returning source files.
+--   but the /list/ of @.c@ files doesn't change, then it will not rebuild (unless the rule
+--   also depends directly on that file).
+--
+--   As a consequence of being tracked, it is an error (detected by running with @--lint@)
+--   if the contents change during the run after this function is called
+--   (e.g. you are generating @.c@ files in this directory),
+--   since the build does not reach a stable point.
+--   .
+--   You should only call this function after generating all relevant files.
 --
 --   For an untracked variant see 'getDirectoryFilesIO'.
 getDirectoryFiles :: FilePath -> [FilePattern] -> Action [FilePath]
@@ -220,6 +218,8 @@ getDirectoryFiles x f = getDirAction $ GetDirFiles x f
 --   All directories are relative to the argument directory. The result is tracked as a
 --   dependency, and if it changes the rule will rerun in subsequent builds.
 --   The rules about creating entries described in 'getDirectoryFiles' also apply here.
+--
+--   This has usage restrictions similar to 'getDirectoryFiles'
 --
 -- > getDirectoryDirs "/Users"
 -- >    -- Return all directories in the /Users directory
