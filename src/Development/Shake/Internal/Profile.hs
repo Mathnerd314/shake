@@ -1,4 +1,4 @@
-{-# LANGUAGE PatternGuards, RecordWildCards #-}
+{-# LANGUAGE PatternGuards, RecordWildCards, DeriveGeneric, DeriveAnyClass #-}
 
 module Development.Shake.Internal.Profile(ProfileEntry(..), Trace(..), writeProfile) where
 
@@ -16,20 +16,15 @@ import Paths_shake
 import qualified System.Time.Extra as T
 import qualified Data.ByteString.Lazy.Char8 as LBS
 import Development.Shake.Classes
+import GHC.Generics
 
 data ProfileEntry = ProfileEntry
     {prfName :: String, prfBuilt :: Int, prfChanged :: Int, prfDepends :: [Int], prfExecution :: Float, prfTraces :: [Trace]}
+    deriving (Generic,Show,NFData,Store)
 
 data Trace = Trace
     {prfCommand :: BS, prfStart :: Float, prfStop :: Float }
-    deriving Show
-
-instance NFData Trace where
-    rnf (Trace a b c) = rnf a `seq` rnf b `seq` rnf c
-
-instance Binary Trace where
-    put (Trace a b c) = put a >> put (BinFloat b) >> put (BinFloat c)
-    get = (\a (BinFloat b) (BinFloat c) -> Trace a b c) <$> get <*> get <*> get
+    deriving (Generic,Show,NFData,Store)
 
 prfTime Trace{..} = prfStop - prfStart
 

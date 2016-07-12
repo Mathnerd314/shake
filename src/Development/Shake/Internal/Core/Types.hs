@@ -13,7 +13,6 @@ import General.Binary
 import Development.Shake.Internal.Value
 import General.Intern as Intern
 
-import Control.Applicative
 import qualified Data.HashSet as Set
 import Data.Maybe
 import Data.List
@@ -23,7 +22,7 @@ import Prelude
 ---------------------------------------------------------------------
 -- UTILITY TYPES
 
-newtype Step = Step Word32 deriving (Eq,Ord,Show,Binary,NFData,Hashable,Typeable)
+newtype Step = Step Word32 deriving (Eq,Ord,Show,Store,NFData,Hashable,Typeable)
 
 initialStep :: Step
 initialStep = Step 1
@@ -59,14 +58,10 @@ emptyStack = Stack Nothing [] Set.empty
 -- OPERATIONS
 
 newtype Depends = Depends {fromDepends :: [[Id]]}
-    deriving (Show,NFData,Monoid)
+    deriving (Show,NFData,Monoid,Store)
 
 subtractDepends :: Depends -> Depends -> Depends
 subtractDepends (Depends pre) (Depends post) = Depends $ take (length post - length pre) post
 
 finalizeDepends :: Depends -> Depends
 finalizeDepends = Depends . reverse . fromDepends
-
-instance Binary Depends where
-  put x = put (BinList . map BinList . fromDepends $ x)
-  get = Depends . map fromBinList . fromBinList <$> get

@@ -351,7 +351,7 @@ progressProgram = do
                 let state | perc == "" = "NoProgress"
                           | failure = "Error"
                           | otherwise = "Normal"
-                rawSystem exe $ ["--title=" ++ msg, "--state=" ++ state] ++ ["--value=" ++ perc | perc /= ""]
+                _ <- rawSystem exe $ ["--title=" ++ msg, "--state=" ++ state] ++ ["--value=" ++ perc | perc /= ""]
                 return ()
 
 

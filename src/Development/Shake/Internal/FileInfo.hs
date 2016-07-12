@@ -11,25 +11,20 @@ import Control.Exception.Extra
 import Development.Shake.Classes
 import Development.Shake.Internal.Errors
 import General.String
+import General.Binary
 import qualified Data.ByteString.Lazy as LBS
-import Data.Word
 import System.IO
 
 #if defined(PORTABLE)
 import System.IO.Error
 import System.Directory
 import Data.Time
-#if __GLASGOW_HASKELL__ < 706
-import System.Time
-#endif
-
 #elif defined(mingw32_HOST_OS)
 import Control.Monad
 import qualified Data.ByteString.Char8 as BS
 import Foreign
 import Foreign.C.Types
 import Foreign.C.String
-
 #else
 import System.IO.Error
 import System.Posix.Files.ByteString
@@ -41,15 +36,16 @@ data FileInfo a = FileEq -- ^ Equal to everything
                    | FileInfo Word32 -- ^ in [2..maxBound]
     deriving (Show,Eq,Typeable,Hashable,NFData,Generic)
 
-instance Binary (FileInfo a) where
-    get = get >>= \case
+instance Store (FileInfo a) where
+    size = ConstSize $ sizeOf (undefined :: Word32)
+    peek = peek >>= \case
         0 -> return FileEq
         1 -> return FileNeq
         a -> return $ FileInfo a
-    put FileEq = put (0 :: Word32)
-    put FileNeq = put (1 :: Word32)
-    put (FileInfo a) | a >= 2 = put a
-                     | otherwise = err ("Invalid FileInfo")
+    poke FileEq = poke (0 :: Word32)
+    poke FileNeq = poke (1 :: Word32)
+    poke (FileInfo a) | a >= 2 = poke a
+                      | otherwise = err ("Invalid FileInfo")
 
 -- | Truncate a Word32 into FileInfo
 fileInfo :: Word32 -> FileInfo a
@@ -71,7 +67,7 @@ getFileHash :: BSU -> IO FileHash
 getFileHash x = withFile (unpackU x) ReadMode $ \h -> do
     s <- LBS.hGetContents h
     let res = fileInfo $ fromIntegral $ hash s
-    evaluate res
+    _ <- evaluate res
     return res
 
 -- If the result isn't strict then we are referencing a much bigger structure,

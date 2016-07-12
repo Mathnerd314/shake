@@ -10,8 +10,10 @@ module Development.Shake.Internal.Core.Storage(
     ) where
 
 import General.Binary
+import Data.Store(decodeEx)
 import General.Intern
 import Development.Shake.Internal.Types
+import Development.Shake.Internal.Value
 import General.Timing
 import General.FileLock
 import qualified General.Ids as Ids
@@ -29,9 +31,9 @@ import System.Exit
 import System.FilePath
 import System.IO
 
+import Data.ByteString (ByteString)
 import qualified Data.ByteString.Lazy.Char8 as LBS
 import qualified Data.ByteString.Lazy as LBS8
-
 
 -- Increment every time the on-disk format/semantics change,
 -- @x@ is for the users version number
@@ -51,7 +53,7 @@ splitVersion abc = (a `LBS.append` b, c)
 
 
 withStorage
-    :: (Eq w, Binary w)
+    :: (Eq w, Show w, Store w)
     => ShakeOptions             -- ^ Storage options
     -> (IO String -> IO ())        -- ^ Logging function
     -> w                        -- ^ Witness
@@ -116,8 +118,8 @@ withStorage ShakeOptions{..} diagnostic witness act = withLockFileDiagnostic dia
                         let slop = fromIntegral $ LBS.length slopRaw
                         when (slop > 0) $ unexpected $ "Last " ++ show slop ++ " bytes do not form a whole record\n"
                         diagnostic $ return $ "Read " ++ show (length xs + 1) ++ " chunks, plus " ++ show slop ++ " slop"
-                        let ws = decode w
-                            ents = map decode xs
+                        let ws = decodeEx w
+                            ents = map decodeEx xs
                         mp <- Ids.empty
                         forM_ ents $ \(k,v) -> Ids.insert mp k v
 
@@ -126,10 +128,10 @@ withStorage ShakeOptions{..} diagnostic witness act = withLockFileDiagnostic dia
                                         [['0' | length c == 1] ++ c | x <- LBS8.unpack x, let c = showHex x ""]
                             let pretty (Left x) = "FAILURE: " ++ show x
                                 pretty (Right x) = x
-                            diagnostic $ return $ "Witnesses " ++ raw w
+                            diagnostic $ return $ "Witnesses " ++ raw (LBS.fromStrict w)
                             forM_ (zip3 [1..] xs ents) $ \(i,x,ent) -> do
                                 x2 <- try_ $ evaluate $ let s = show ent in rnf s `seq` s
-                                diagnostic $ return $ "Chunk " ++ show i ++ " " ++ raw x ++ " " ++ pretty x2
+                                diagnostic $ return $ "Chunk " ++ show i ++ " " ++ raw (LBS.fromStrict x) ++ " " ++ pretty x2
                             diagnostic $ return $ "Slop " ++ raw slopRaw
 
                         size <- Ids.sizeUpperBound mp
@@ -180,19 +182,19 @@ withStorage ShakeOptions{..} diagnostic witness act = withLockFileDiagnostic dia
             hSetFileSize h 0
             hSeek h AbsoluteSeek 0
             LBS.hPut h ver
-            writeChunk h $ encode witness
-            mapM_ (writeChunk h . encode) $ Ids.toList mp
+            writeChunk h $ LBS.fromStrict $ encode witness
+            Ids.toList mp >>= mapM_ (writeChunk h . LBS.fromStrict . encode)
             hFlush h
             diagnostic $ return "Flush"
 
         -- continuation (since if we do a compress, h changes)
         continue h mp = do
-            whenM (Ids.null mp && shakeWrite) $
+            whenM (Ids.null mp &&^ return shakeWrite) $
                 reset h mp -- might as well, no data to lose, and need to ensure a good witness table
                            -- also lets us recover in the case of corruption
             flushThread shakeWrite shakeFlush h $ \out -> do
                 addTiming "With database"
-                act mp $ \k v -> out $ toChunk $ encode (k, v)
+                act mp $ \k v -> out . toChunk . LBS.fromStrict $ encode (k, v)
 
 
 withLockFileDiagnostic :: (IO String -> IO ()) -> FilePath -> IO a -> IO a
@@ -220,7 +222,7 @@ flushThread True flush h act = do
         Just flush -> fmap Just $ forkIO $ forever $ do
             takeMVar kick
             threadDelay $ ceiling $ flush * 1000000
-            tryTakeMVar kick
+            _ <- tryTakeMVar kick
             writeChan chan $ hFlush h >> return True
 
     root <- myThreadId
@@ -229,7 +231,7 @@ flushThread True flush h act = do
         whileM $ join $ readChan chan
 
     (act $ \s -> do
-            evaluate $ LBS.length s -- ensure exceptions occur on this thread
+            _ <- evaluate $ LBS.length s -- ensure exceptions occur on this thread
             writeChan chan $ LBS.hPut h s >> tryPutMVar kick () >> return True)
         `finally` do
             maybe (return ()) killThread flusher
@@ -238,21 +240,21 @@ flushThread True flush h act = do
 
 
 -- Return the amount of junk at the end, along with all the chunk
-readChunks :: LBS.ByteString -> ([LBS.ByteString], LBS.ByteString)
+readChunks :: LBS.ByteString -> ([ByteString], LBS.ByteString)
 readChunks x
     | Just (n, x) <- grab 4 x
-    , Just (y, x) <- grab (fromIntegral (decode n :: Word32)) x
+    , Just (y, x) <- grab (fromIntegral (decodeEx n :: Word32)) x
     = first (y :) $ readChunks x
     | otherwise = ([], x)
     where
-        grab i x | LBS.length a == i = Just (a, b)
+        grab i x | LBS.length a == i = Just (LBS.toStrict a, b)
                  | otherwise = Nothing
             where (a,b) = LBS.splitAt i x
 
 
 toChunk :: LBS.ByteString -> LBS.ByteString
 toChunk x = n `LBS.append` x
-    where n = encode (fromIntegral $ LBS.length x :: Word32)
+    where n = LBS.fromStrict $ encode (fromIntegral $ LBS.length x :: Word32)
 
 
 -- | Is the exception asyncronous, not a "coding error" that should be ignored

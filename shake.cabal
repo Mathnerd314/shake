@@ -99,6 +99,8 @@ library
         deepseq >= 1.1,
         primitive
 
+    ghc-options: -Wunused-do-bind
+
     if flag(portable)
         cpp-options: -DPORTABLE
         if impl(ghc < 7.6)

@@ -1,15 +1,15 @@
 {-# LANGUAGE MultiParamTypeClasses, FlexibleInstances, DeriveFunctor, DeriveDataTypeable, Rank2Types, NoMonomorphismRestriction #-}
 
-module General.Binary (Word16, Word32, peekBS, pokeBS, encode, decodeIO) where
+module General.Binary (Word16, Word32, Peek, Poke, Store(..), Size(..), contramapSize, peekBS, pokeBS, encode, decode, sizeOf) where
 
+import Foreign.Storable (sizeOf)
 import Foreign.Ptr (minusPtr)
 import Data.Word
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BS
-import qualified Data.ByteString.Unsafe as BS
 
 import Data.Store
-import Data.Store.Internal()
+import Data.Store.Internal
 import Data.Store.Core
 
 pokeBS :: BS.ByteString -> Poke ()
@@ -17,16 +17,11 @@ pokeBS x = let (sourceFp, sourceOffset, sourceLength) = BS.toForeignPtr x
            in pokeFromForeignPtr sourceFp sourceOffset sourceLength
 
 peekBS :: Peek BS.ByteString
-peekBS = Peek $ \start end -> let
+peekBS = do
+  len <- Peek $ \end start -> return (start, end `minusPtr` start)
+  fp <- peekToPlainForeignPtr "General.Binary.peekBS" len
+  return (BS.PS fp 0 len)
 
-
-  do { fp <- peekToPlainForeignPtr "General.Binary.peekBS" len
-            ; return (BS.PS fp 0 len) }
-GHC.Ptr.Ptr byte
-                                                     -> GHC.Ptr.Ptr byte
-                                                     -> IO (GHC.Ptr.Ptr byte, a)
----------------------------------------------------------------------
--- BINARY SERIALISATION
 {-
 type ByteOffset = Int64
 
