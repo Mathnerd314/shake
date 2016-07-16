@@ -1,7 +1,7 @@
 {-# LANGUAGE ExistentialQuantification, InstanceSigs, ScopedTypeVariables #-}
 
 module Development.Shake.Internal.Core.Rendezvous(
-    Waiting, newWaiting, afterWaiting,
+    Waiting, newWaiting, afterWaiting, runWaiting,
     Answer(..), Compute(..),
     rendezvous
     ) where
@@ -48,6 +48,8 @@ instance Typeable a => Show (Waiting a) where
     show :: forall a. Typeable a => Waiting a -> String
     show _ = "Waiting " ++ show (typeOf (undefined :: a))
 
+runWaiting :: Waiting a -> a -> IO ()
+runWaiting (Waiting id ref) x = ($ x) =<< readIORef ref
 
 newWaiting :: IO (Waiting a, a -> IO ())
 newWaiting = do
@@ -73,6 +75,7 @@ rendezvous xs = do
         todo <- newIORef $ length later
         forM_ (zip [0..] xs) $ \(i,x) -> case x of
             Now (Continue c) -> writeArray result i c
+            -- Now Abort is handled above
             Later w ->
               let waitOn w = afterWaiting w $ \v -> do
                     t <- readIORef todo
@@ -87,6 +90,6 @@ rendezvous xs = do
                             when (t == 1) $ do
                                 rs <- unsafeFreezeArray result
                                 run $ Right $ map (indexArray rs) [0..n-1]
-                        WaitAgain kw -> waitOn kw
+                        WaitAgain w' -> waitOn w'
               in waitOn w
         return $ Later waiting

@@ -1,5 +1,5 @@
-{-# LANGUAGE RecordWildCards, GeneralizedNewtypeDeriving, ScopedTypeVariables, PatternGuards, ViewPatterns #-}
-{-# LANGUAGE ExistentialQuantification, MultiParamTypeClasses, ConstraintKinds, DeriveFunctor #-}
+{-# LANGUAGE RecordWildCards, GeneralizedNewtypeDeriving, DeriveFunctor, ScopedTypeVariables, PatternGuards #-}
+{-# LANGUAGE ExistentialQuantification, MultiParamTypeClasses, ConstraintKinds, ViewPatterns #-}
 
 module Development.Shake.Internal.Core.Run(
     run,
@@ -33,6 +33,7 @@ import Data.Maybe
 import Data.IORef
 import System.IO.Extra
 import System.Time.Extra
+import Numeric.Extra
 
 import Development.Shake.Classes
 import Development.Shake.Internal.Core.Action
@@ -352,6 +353,11 @@ runKey_ global@Global{..} i k r deps stack step continue = do
                     Left e -> continue . Error . toException =<< shakeException global (showStack globalDatabase stack) e
                     Right r -> continue $ Ready r
 
+-- | Apply a single rule, equivalent to calling 'apply' with a singleton list. Where possible,
+--   use 'apply' to allow parallelism.
+apply1 :: (ShakeValue key, ShakeValue value) => key -> Action value
+apply1 = fmap head . apply . return
+
 ---------------------------------------------------------------------
 -- TRACKING
 
@@ -508,7 +514,10 @@ newThrottle :: String -> Int -> Double -> Rules Resource
 newThrottle name count period = liftIO $ newThrottleIO name count period
 
 -- | Run an action which uses part of a finite resource. For more details see 'Resource'.
---   You cannot depend on a rule (e.g. 'need') while a resource is held.
+--   Note that if you call 'withResource' while a resource is held, and the new resource is not
+--   available, all resources held will be released while waiting for the new resource, and
+--   re-acquired after; this may cause undesirable behavior. Also note that 'need' and 'apply'
+--   will similarly release all resources while executing a dependency, and re-acquire them later.
 withResource :: Resource -> Int -> Action a -> Action a
 withResource r i act = do
     Global{..} <- Action getRO

@@ -11,7 +11,6 @@ import Prelude hiding (lookup)
 import qualified Data.HashMap.Strict as Map
 import Data.List(foldl')
 
-
 -- Invariant: The first field is the highest value in the Map
 data Intern a = Intern {-# UNPACK #-} !Word32 !(Map.HashMap a Id)
 
@@ -41,3 +40,4 @@ toList (Intern a b) = Map.toList b
 
 fromList :: (Eq a, Hashable a) => [(a, Id)] -> Intern a
 fromList xs = Intern (foldl' max 0 [i | (_, Id i) <- xs]) (Map.fromList xs)
+

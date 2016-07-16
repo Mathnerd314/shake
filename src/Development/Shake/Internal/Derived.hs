@@ -4,6 +4,7 @@ module Development.Shake.Internal.Derived(
     writeFile', writeFileLines, writeFileChanged,
     withTempFile, withTempDir,
     getHashedShakeVersion,
+    apply1,
     par, forP
     ) where
 
@@ -15,8 +16,6 @@ import System.IO.Extra hiding (withTempFile, withTempDir, readFile')
 
 import Development.Shake.Internal.Core.Run
 import Development.Shake.Internal.Rules.File
-import Development.Shake.FilePath
-import Development.Shake.Internal.Types
 import qualified Data.ByteString as BS
 import Data.Hashable
 import Prelude

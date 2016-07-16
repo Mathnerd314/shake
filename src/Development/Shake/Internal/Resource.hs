@@ -35,11 +35,11 @@ resourceId = modifyVar resourceIds $ \i -> let j = i + 1 in j `seq` return (j, j
 --   over a short time period.
 --
 --   These resources are used with 'Development.Shake.withResource' when defining rules. Typically only
---   system commands (such as 'Development.Shake.cmd') should be run inside 'Development.Shake.withResource',
---   not commands such as 'Development.Shake.need'.
+--   IO-intensive or heavy system commands (such as 'Development.Shake.cmd') should be run inside 'Development.Shake.withResource',
+--   as commands such as 'Development.Shake.need' automatically use a CPU thread resource.
 --
 --   Be careful that the actions run within 'Development.Shake.withResource' do not themselves require further
---   resources, or you may get a \"thread blocked indefinitely in an MVar operation\" exception.
+--   copies of the resource, or you may get a \"thread blocked indefinitely in an MVar operation\" exception.
 --   If an action requires multiple resources, use 'Development.Shake.withResources' to avoid deadlock.
 data Resource = Resource
     {resourceOrd :: Int

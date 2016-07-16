@@ -31,7 +31,7 @@ infix 1 &?>, &%>
 newtype FilesQ = FilesQ [FileQ]
     deriving (Typeable,Eq,Hashable,Binary,NFData)
 
-instance Show FilesQ where show (FilesQ xs) = unwords $ map (showQuote . show) xs
+instance Show FilesQ where show (FilesQ xs) = unwords $ map (wrapQuote . show) xs
 
 newtype FilesRule = FilesRule { fromFilesRule :: [FileQ] -> Maybe (Action ()) }
     deriving (Typeable)
