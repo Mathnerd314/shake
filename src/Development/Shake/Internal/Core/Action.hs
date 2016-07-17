@@ -15,6 +15,7 @@ import Control.Exception.Extra
 import Control.Applicative
 import Control.Monad.Extra
 import Control.Monad.IO.Class
+import Control.DeepSeq
 import Data.Typeable
 import Data.Function
 import Data.Either.Extra
@@ -39,15 +40,9 @@ import Prelude
 
 -- | The 'Action' monad, use 'liftIO' to raise 'IO' actions into it, and 'Development.Shake.need' to execute files.
 --   Action values are used by 'addUserRule' and 'action'. The 'Action' monad tracks the dependencies of a rule.
+--   To raise an exception call 'error', 'fail' or @'liftIO' . 'throwIO'@.
 newtype Action a = Action {fromAction :: RAW Global Local a}
     deriving (Functor, Applicative, Monad, MonadIO, Typeable)
-
-data BuiltinResult value = BuiltinResult
-    { resultStoreB :: Builder -- ^ the associated store result
-    , resultValueB :: value -- ^ dynamic return value limited to lifetime of the program
-    , ranDependsB :: Bool -- ^ whether the dependencies for this rule were 'apply'-d
-    , unchangedB :: Bool -- ^ whether the value is the same, so that there is no need to run reverse dependencies
-    } deriving (Typeable, Functor)
 
 data BuiltinRule_ = BuiltinRule_ (Key -- ^ Key that you want to build.
                                -> Maybe Result -- ^ the previous result in the database, if any
@@ -71,25 +66,6 @@ data Global = Global
     ,globalTrackAbsent :: IORef [(Key, Key)] -- in rule fst, snd must be absent
     ,globalProgress :: IO Progress
     }
-
--- local variables of Action
-data Local = Local
-    -- constants
-    {localStack :: Stack
-    -- stack scoped local variables
-    ,localVerbosity :: Verbosity
-    ,localBlockApply ::  Maybe String -- reason to block apply, or Nothing to allow
-    -- mutable local variables
-    ,localDepends :: Depends -- built up in reverse
-    ,localDiscount :: !Seconds
-    ,localTraces :: [Trace] -- in reverse
-    ,localTrackAllows :: [Key -> Bool]
-    ,localTrackUsed :: [Key]
-    }
-
-newLocal :: Stack -> Verbosity -> Local
-newLocal stack verb = Local stack verb Nothing [] 0 [] [] []
-
 
 ---------------------------------------------------------------------
 -- RAW WRAPPERS
@@ -245,5 +221,7 @@ traced' msg act = do
     putNormal $ "# " ++ msg ++ " (for " ++ showTopStack stack ++ ")"
     res <- act
     stop <- liftIO globalTimestamp
-    Action $ modifyRW $ \s -> s{localTraces = Trace (pack msg) (doubleToFloat start) (doubleToFloat stop) : localTraces s}
+    let trace = Trace (pack msg) (doubleToFloat start) (doubleToFloat stop)
+    liftIO $ evaluate $ rnf trace
+    Action $ modifyRW $ \s -> s{localTraces = trace : localTraces s}
     return res

@@ -5,11 +5,9 @@
 module Development.Shake.Internal.Core.Database(
     Trace(..),
     Database, withDatabase, assertFinishedDatabase,
-    listDepends, lookupDependencies, Step, incStep, Result(..), LiveResult(..), Status(Ready,Error),
-    Ops(..), build, Id, Depends, subtractDepends, finalizeDepends,
-    progress,
-    Stack, emptyStack, topStack, showStack, showTopStack,
-    toReport, checkValid, listLive
+    listDepends, lookupDependencies, LiveResult(..),
+    BuildKey(..), build, Id, Depends, subtractDepends, finalizeDepends,
+    progress, toReport, checkValid, listLive
     ) where
 
 import GHC.Generics (Generic)
@@ -57,15 +55,14 @@ type Map = Map.HashMap
 ---------------------------------------------------------------------
 -- CENTRAL TYPES
 
-type StatusDB = Ids.Ids (Key, Status)
+type StatusDB =
 type InternDB = IORef (Intern Key)
 
 -- | Invariant: The database does not have any cycles where a Key depends on itself
 data Database = Database
     {lock :: Lock
     ,intern :: InternDB
-    ,status :: StatusDB
-    ,oldstatus :: Ids.Ids (Key, Result)
+    ,status :: Ids.Ids (Key, Status)
     ,step :: {-# UNPACK #-} !Step
     ,journal :: Id -> Key -> Result -> IO ()
     ,diagnostic :: IO String -> IO () -- ^ logging function
@@ -88,9 +85,12 @@ data Result = Result
     } deriving (Show,Generic,Store,NFData)
 
 data LiveResult = LiveResult
-    { resultValue :: Dynamic -- ^ dynamic return value limited to lifetime of the program
-    , resultStore :: Result -- ^ persistent database value
-    , traces :: [Trace] -- ^ a trace of the expensive operations (start/end in seconds since beginning of run)
+    {resultValue :: Dynamic -- ^ dynamic return value limited to lifetime of the program
+    ,built :: {-# UNPACK #-} !Step -- ^ when it was actually run
+    ,changed :: {-# UNPACK #-} !Step -- ^ the step for deciding if it's valid
+    ,depends :: Depends -- ^ dependencies (stored in order of appearance; don't run them early)
+    ,execution :: {-# UNPACK #-} !Float -- ^ how long it took when it was last run (seconds)
+    ,traces :: [Trace] -- ^ a trace of the expensive operations (start/end in seconds since beginning of run)
     } deriving (Show)
 
 instance NFData LiveResult where
@@ -99,10 +99,14 @@ instance NFData LiveResult where
 ---------------------------------------------------------------------
 -- OPERATIONS
 
-data Ops = Ops
-    { runKey :: Id -> Key -> Maybe Result -> Bool -> Stack -> Step -> Capture Status
-        -- ^ Given a Key and its previous result and if its dependencies changed, run it and return the status
-    }
+type BuildKey
+         = Stack -- Given the current stack with the key added on
+        -> Step -- And the current step
+        -> Key -- The key to build
+        -> Maybe Result -- A previous result, or Nothing if never been built before
+        -> Bool -- True if any of the children were dirty
+        -> Capture (Either SomeException (Bool, Result))
+            -- Either an error, or a result.
 
 internKey :: InternDB -> Key -> IO Id
 internKey intern k = do
@@ -126,7 +130,22 @@ updateStatus Database{..} i k v done = do
     return oldv
 
 reportResult :: Database -> Id -> Key -> Status {- Ready | Error -} -> IO ()
-reportResult d@Database{..} i k res = do
+reportResult d@Database{..} i k x = do
+    let ldeps = finalizeDepends localDepends
+    let ans = LiveResult
+              { resultValue = resultValueB
+              , resultStore = Result
+                { result = resultStoreB
+                , depends = if ranDependsB then ldeps else maybe ldeps depends r
+                , changed = if unchangedB then maybe step changed r else step
+                , built = step
+                , execution = doubleToFloat $ dur - localDiscount
+                }
+              , traces = reverse localTraces
+              }
+    res <- case x of
+        Left e -> Error . toException =<< shakeException global (showStack globalDatabase stack) e
+        Right r -> Ready r
     withLock lock $ do
         oldv <- updateStatus d i (k,res)
         case oldv of
@@ -141,6 +160,7 @@ reportResult d@Database{..} i k res = do
         _ -> diagnostic $ "result " ++ atom k ++ " = " ++ atom ans
             -- don't store errors
 
+
 showStack :: Database -> [Id] -> IO [String]
 showStack Database{..} xs = do
     forM (reverse xs) $ \x ->
@@ -150,8 +170,8 @@ showStack Database{..} xs = do
 -- 'build' first takes the state lock and (on a single thread) performs as many transitions as it can without waiting on a mutex or running any rules.
 -- Then it releases the state lock and runs the rules in the thread pool and waits for all of them to finish
 -- A build requiring no rules should not result in any thread contention.
-build :: Pool -> Database -> Ops -> Stack -> Maybe String -> [Key] -> Capture (Either SomeException (Seconds,Depends,[LiveResult]))
-build pool database@Database{..} Ops{..} stack maybeBlock ks continue =
+build :: Pool -> Database -> BuildKey -> Stack -> [Key] -> Capture (Either SomeException (Seconds,Depends,[LiveResult]))
+build pool database@Database{..} runKey stack ks continue =
     join $ withLock lock $ do
         is <- forM ks $ internKey intern
 
@@ -238,7 +258,7 @@ build pool database@Database{..} Ops{..} stack maybeBlock ks continue =
             (w', _) <- newWaiting
             let w = Waiting w' r
             _ <- updateStatus database i k w
-            addPoolLowPriority pool $ runKey i k r dirtyChildren (addStack i k stack) step (reportResult database i k)
+            addPoolLowPriority pool $ runKey (addStack i k stack) step k r dirtyChildren (reportResult database i k)
             return w
 
 ---------------------------------------------------------------------
@@ -352,11 +372,12 @@ checkValid Database{..} missing keyCheck = do
     diagnostic $ return "Starting validity/lint checking"
 
     bad <- keyCheck <$> Ids.toList status
+
     unless (null bad) $ do
         let n = length bad
         errorStructured
             ("Lint checking error - " ++ (if n == 1 then "value has" else show n ++ " values have")  ++ " changed since being depended upon")
-            (intercalate [("",Just "")] [ [("Key", Just $ show key),("Cached value", Just $ show result),("New value", Just now)]
+            (intercalate [("",Just "")] [ [("Key", Just $ show key),("Old", Just $ show result),("New", Just now)]
                                         | (key, result, now) <- bad])
             ""
 

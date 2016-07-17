@@ -2,7 +2,7 @@
 -- | Thread pool implementation.
 module Development.Shake.Internal.Core.Pool(
     Pool, runPool,
-    addPoolHighPriority, addPoolMediumPriority, addPoolLowPriority,
+    addPool,
     increasePool
     ) where
 
@@ -79,25 +79,18 @@ step pool@(Pool var done) op = do
             _ -> return $ Just s
 
 
+data Priority = LowPriority -- ^ Low priority is suitable for new tasks that are just starting. Currently equivalent to Medium.
+              | MediumPriority -- ^ Medium priority is suitable for tasks that are resuming running after a pause.
+              | HighPriority -- ^ High priority is suitable for tasks that have detected failure and are resuming to propagate that failure.
+  deriving (Eq,Ord,Show,Read,Typeable,Data,Enum,Bounded)
+
 -- | Add a new task to the pool.
---   Medium priority is suitable for tasks that are resuming running after a pause.
-addPoolMediumPriority :: Pool -> IO a -> IO ()
-addPoolMediumPriority pool act = step pool $ \s -> do
-    todo <- return $ enqueue (void act) (todo s)
+addPool :: Priority -> Pool -> IO a -> IO ()
+addPool p pool act = step pool $ \s -> do
+    todo <- return $ case p of
+      HighPriority -> enqueuePriority (void act) (todo s)
+      _ -> enqueue (void act) (todo s)
     return s{todo = todo}
-
--- | Add a new task to the pool.
---   Low priority is suitable for new tasks that are just starting.
-addPoolLowPriority :: Pool -> IO a -> IO ()
-addPoolLowPriority = addPoolMediumPriority
-
--- | Add a new task to the pool.
---   High priority is suitable for tasks that have detected failure and are resuming to propagate that failure.
-addPoolHighPriority :: Pool -> IO a -> IO ()
-addPoolHighPriority pool act = step pool $ \s -> do
-    todo <- return $ enqueuePriority (void act) (todo s)
-    return s{todo = todo}
-
 
 -- | Temporarily increase the pool by 1 thread. Call the cleanup action to restore the value.
 --   After calling cleanup you should requeue onto a new thread.

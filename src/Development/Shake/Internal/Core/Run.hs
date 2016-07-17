@@ -216,15 +216,17 @@ run opts@ShakeOptions{..} rs = (if shakeLineBuffering then lineBuffering else id
                 runPool (shakeThreads == 1) shakeThreads $ \pool -> do
                     let s0 = Global database pool cleanup start (rules rs) (userrules rs) output opts diagnostic lint after absent getProgress
                     let s1 = Local emptyStack shakeVerbosity Nothing mempty 0 [] [] []
-                    forM_ (actions rs) $ \act ->
+                    forM_ actions $ \act ->
                         addPool pool $ runAction s0 s1 act $ \x -> case x of
                             Left e -> raiseError =<< shakeException s0 (return ["Top-level action/want"]) e
                             Right x -> return x
                 maybe (return ()) (throwIO . snd) =<< readIORef except
                 assertFinishedDatabase database
 
-                when (null $ actions rs) $
-                    when (shakeVerbosity >= Normal) $ output Normal "Warning: No want/action statements, nothing to do"
+                let putWhen lvl msg = when (shakeVerbosity >= lvl) $ output lvl msg
+
+                when (null actions) $
+                    putWhen Normal "Warning: No want/action statements, nothing to do"
 
                 when (basicLint shakeLint) $ do
                     addTiming "Lint checking"
@@ -237,6 +239,13 @@ run opts@ShakeOptions{..} rs = (if shakeLineBuffering then lineBuffering else id
                             forM_ ks $ \(i,(key,v)) -> case v of
                                 Ready ro -> do
                                     let reply = undefined
+--     -- Do not use a forM here as you use too much stack space
+--     bad <- (\f -> foldM f [] status) $ \seen (i,v) -> case v of
+--         (key, Ready Result{..}) -> do
+--             good <- check key result
+--             diagnostic $ return $ "Checking if " ++ show key ++ " is " ++ show result ++ ", " ++ if isNothing good then "passed" else "FAILED"
+--             return $ [(key, result, now) | not $ specialAlwaysRebuilds result, Just now <- [good]] ++ seen
+--         _ -> return seen
 --                                         reply (Error e) = raiseError =<< shakeException s0 (return ["Lint-checking"]) e
 --                                         reply (Ready r) = do
 --                                             let now = built r == changed r
@@ -249,27 +258,33 @@ run opts@ShakeOptions{..} rs = (if shakeLineBuffering then lineBuffering else id
                                         reply
                         maybe (return ()) (throwIO . snd) =<< readIORef except
                         readIORef bad
-                    when (shakeVerbosity >= Loud) $ output Loud "Lint checking succeeded"
+                    putWhen Loud "Lint checking succeeded"
                 when (shakeReport /= []) $ do
                     addTiming "Profile report"
                     report <- toReport database
                     forM_ shakeReport $ \file -> do
-                        when (shakeVerbosity >= Normal) $
-                            output Normal $ "Writing report to " ++ file
+                        putWhen Normal $ "Writing report to " ++ file
                         writeProfile file report
                 when (shakeLiveFiles /= []) $ do
                     addTiming "Listing live"
-                    -- TODO: actual pruning
---                     live <- listLive database
---                     let liveFiles = [show k | k <- live, specialIsFileKey $ typeKey k]
---                     forM_ shakeLiveFiles $ \file -> do
---                         when (shakeVerbosity >= Normal) $
---                             output Normal $ "Writing live list to " ++ file
---                         (if file == "-" then putStr else writeFile file) $ unlines liveFiles
+                    -- TODO: get working
+                    live <- listLive database
+                    let liveFiles = [show k | k <- live, specialIsFileKey $ typeKey k]
+                    forM_ shakeLiveFiles $ \file -> do
+                        putWhen Normal $ "Writing live list to " ++ file
+                        (if file == "-" then putStr else writeFile file) $ unlines liveFiles
             sequence_ . reverse =<< readIORef after
 
 lineBuffering :: IO a -> IO a
-lineBuffering = withBuffering stdout LineBuffering . withBuffering stderr LineBuffering
+lineBuffering act = do
+    -- instead of withBuffering avoid two finally handlers and stack depth
+    out <- hGetBuffering stdout
+    err <- hGetBuffering stderr
+    hSetBuffering stdout LineBuffering
+    hSetBuffering stderr LineBuffering
+    act `finally` do
+        hSetBuffering stdout out
+        hSetBuffering stderr err
 
 -- | Whether to do basic lint checks
 basicLint :: Lint -> Bool
@@ -313,15 +328,16 @@ applyKeyValue ks = do
     stack <- Action $ getsRW localStack
     block <- Action $ getsRW localBlockApply
     (dur, dep, vs) <- Action $ captureRAW $ build globalPool globalDatabase (Ops (runKey_ global)) stack block ks
+    (dur, dep, vs) <- Action $ captureRAW $ build globalPool globalDatabase (BuildKey $ runKey global) stack ks
     Action $ modifyRW $ \s -> s{localDiscount=localDiscount s + dur, localDepends=dep <> localDepends s}
     return vs
 
-runKey_ :: Global -> Id -> Key -> Maybe Result -> Bool -> Stack -> Step -> Capture Status
-runKey_ global@Global{..} i k r deps stack step continue = do
-    time <- offsetTime
-    let s = Local stack (shakeVerbosity globalOptions) Nothing mempty 0 [] [] []
-    let top = showTopStack stack
+runKey :: Global -> Stack -> Step -> Key -> Maybe Result -> Bool -> Capture (Either SomeException (Bool, BuiltinResult))
+runKey global@Global{globalOptions=ShakeOptions{..},..} stack step k r dirtyChildren continue = do
+    time <- liftIO $ offsetTime
+    let s = newLocal stack shakeVerbosity
     runAction global s (do
+        let top = showTopStack stack
         let tk = typeKey k
         case Map.lookup tk globalRules of
             Nothing -> liftIO $ errorNoRuleToBuildType tk (Just $ show k) Nothing
@@ -329,29 +345,16 @@ runKey_ global@Global{..} i k r deps stack step continue = do
                 liftIO $ evaluate $ rnf k
                 liftIO $ globalLint $ "before building " ++ top
                 putWhen Chatty $ "# " ++ show k
-                let r' = if shakeRead globalOptions then r else Nothing
-                BuiltinResult{..} <- execute k r' deps
-                when (LintFSATrace == shakeLint globalOptions) trackCheckUsed
+                let r' = if shakeRead then r else Nothing
+                res <- execute k r' dirtyChildren
+                when (LintFSATrace == shakeLint) trackCheckUsed
                 liftIO $ globalLint $ "after building " ++ top
                 dur <- liftIO time
-                Local{..} <- Action $ getRW
-                let ldeps = finalizeDepends localDepends
-                let ans = LiveResult
-                          { resultValue = resultValueB
-                          , resultStore = Result
-                            { result = resultStoreB
-                            , depends = if ranDependsB then ldeps else maybe ldeps depends r
-                            , changed = if unchangedB then maybe step changed r else step
-                            , built = step
-                            , execution = doubleToFloat $ dur - localDiscount
-                            }
-                          , traces = reverse localTraces
-                          }
+                local <- Action $ getRW
+                let ans = (res, dur, local)
                 liftIO $ evaluate $ rnf ans
                 return ans
-                ) $ \x -> case x of
-                    Left e -> continue . Error . toException =<< shakeException global (showStack globalDatabase stack) e
-                    Right r -> continue $ Ready r
+                ) continue
 
 -- | Apply a single rule, equivalent to calling 'apply' with a singleton list. Where possible,
 --   use 'apply' to allow parallelism.

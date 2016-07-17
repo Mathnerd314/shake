@@ -7,11 +7,13 @@ module Development.Shake.Internal.Core.Types(
     Step, initialStep, incStep,
     Depends(..), subtractDepends, finalizeDepends,
     Stack, emptyStack, topStack, stackIds, showTopStack, addStack, checkStack,
+    BuiltinResult(..), Local(..), newLocal
     ) where
 
 import Development.Shake.Classes
 import General.Binary
 import Development.Shake.Internal.Value
+import Development.Shake.Internal.Profile
 import General.Intern as Intern
 
 import qualified Data.HashSet as Set
@@ -114,3 +116,33 @@ subtractDepends (Depends pre) (Depends post) = Depends $ take (length post - len
 
 finalizeDepends :: Depends -> Depends
 finalizeDepends = Depends . reverse . fromDepends
+
+-- | Results
+data BuiltinResult value
+  = NoResult -- ^ A missing result, to be filled in later by a different rule, or result in an error at the end.
+  | BuiltinResult
+    { resultStoreB :: Maybe (Int, Poke ()) -- ^ action to write the associated store result, or Nothing to avoid writing it
+    , resultValueB :: value -- ^ dynamic return value used during the lifetime of the program
+    , ranDependsB :: Bool -- ^ whether the dependencies for this rule were 'apply'-d
+    , unchangedB :: Bool -- ^ whether the value is the same, so that there is no need to run reverse dependencies
+    } deriving (Typeable, Functor)
+
+-- local variables of rules
+data Local = Local
+    -- constants
+    {localStack :: Stack
+    -- stack scoped local variables
+    ,localVerbosity :: Verbosity
+    ,localResources :: [Resource] -- resources
+    -- mutable local variables
+    ,localDepends :: Depends -- built up in reverse
+    ,localDiscount :: !Seconds
+    ,localTraces :: [Trace] -- in reverse
+    ,localTrackAllows :: [Key -> Bool]
+    ,localTrackUsed :: [Key]
+    }
+
+newLocal :: Stack -> Verbosity -> Local
+newLocal stack verb = Local stack verb Nothing mempty 0 [] [] []
+
+
