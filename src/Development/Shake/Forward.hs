@@ -39,12 +39,11 @@ module Development.Shake.Forward(
 
 import Development.Shake
 import Development.Shake.Internal.Core.Run
-import Development.Shake.Core2
 import Development.Shake.Internal.Core.Monad
+import Development.Shake.Internal.Core.Types
 import Development.Shake.Command
 import Development.Shake.Classes
 import Development.Shake.FilePath
-import Development.Shake.Internal.Value
 
 import Data.Binary
 import Data.Binary.Put
@@ -55,12 +54,11 @@ import Numeric
 import Data.IORef
 import qualified Data.HashMap.Strict as Map
 
-newtype ForwardQ = ForwardQ Value
+newtype ForwardQ = ForwardQ ByteString
     deriving (Show,Typeable,Eq,Hashable,Binary,NFData)
 
--{-# NOINLINE globalForwards #-}
--- |
-globalForwards :: IORef (Map.HashMap Value (Action Value))
+{-# NOINLINE globalForwards #-}
+globalForwards :: IORef (Map.HashMap ByteString (Action ByteString))
 globalForwards = unsafePerformIO $ newIORef Map.empty
 
 -- | Given an 'Action', turn it into a 'Rules' structure which runs in forward mode.

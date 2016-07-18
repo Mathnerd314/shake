@@ -129,17 +129,16 @@ module Development.Shake(
     -- * Special rules
     alwaysRerun,
     -- * Resources
-    Resource, newResource, newResourceIO, withResource, withResources,
-    newThrottle, newThrottleIO,
+    Resource, newResource, withResource, withResources,
+    newThrottle,
     unsafeExtraThread,
     -- * Cache
-    newCache, newCacheIO,
+    newCache,
     ) where
 
 -- I would love to use module export in the above export list, but alas Haddock
 -- then shows all the things that are hidden in the docs, which is terrible.
 import Control.Monad.IO.Class
-import Development.Shake.Internal.Value
 import Development.Shake.Internal.Types
 import Development.Shake.Internal.Core.Run hiding (trackAllow)
 import Development.Shake.Internal.Core.Rules

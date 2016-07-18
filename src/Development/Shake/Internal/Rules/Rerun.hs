@@ -6,13 +6,13 @@ module Development.Shake.Internal.Rules.Rerun(
 
 import Development.Shake.Internal.Core.Run
 import Development.Shake.Internal.Core.Rules
+import Development.Shake.Internal.Types
 import Development.Shake.Classes
-import Development.Shake.Types
 
 import qualified Data.ByteString.Lazy as LBS
 
 newtype AlwaysRerunQ = AlwaysRerunQ ()
-    deriving (Typeable,Eq,Hashable,Binary,NFData,Show)
+    deriving (Typeable,Eq,Hashable,Store,NFData,Show)
 
 -- | Always rerun the associated action. Useful for defining rules that query
 --   the environment. For example:
@@ -43,7 +43,7 @@ defaultRuleRerun = do
             }
 
 newtype OutputCheck = OutputCheck ()
-    deriving (Typeable,Eq,Hashable,Binary,NFData,Show)
+    deriving (Typeable,Eq,Hashable,Store,NFData,Show)
 
 -- | A tracking version of 'shakeOutputCheck' that will re-run all relevant rules when it changes.
 outputCheck :: Action Bool

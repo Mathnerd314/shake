@@ -6,17 +6,18 @@ module Development.Shake.Internal.Core.Types(
     Step, initialStep, incStep,
     Depends(..), subtractDepends, finalizeDepends,
     Stack, emptyStack, topStack, stackIds, showTopStack, addStack, checkStack,
-    BuiltinResult(..), Local(..), newLocal
+    BuiltinResult(..), Local(..), newLocal,
+    ByteString
     ) where
 
 import Development.Shake.Classes
 import General.Binary
-import Development.Shake.Internal.Value
 import Development.Shake.Internal.Profile
 import Development.Shake.Internal.Types
 import Development.Shake.Internal.Resource
 import General.Intern as Intern
 import System.Time.Extra
+import Data.ByteString (ByteString)
 
 import qualified Data.HashSet as Set
 import Data.Maybe
@@ -36,18 +37,18 @@ incStep (Step i) = Step $ i + 1
 ---------------------------------------------------------------------
 -- CALL STACK
 
-data Stack = Stack (Maybe Key) [Id] !(Set.HashSet Id)
+data Stack = Stack (Maybe String) [Id] !(Set.HashSet Id)
 
 stackIds :: Stack -> [Id]
 stackIds (Stack _ xs _) = xs
 
-addStack :: Id -> Key -> Stack -> Stack
+addStack :: Id -> String -> Stack -> Stack
 addStack x key (Stack _ xs set) = Stack (Just key) (x:xs) (Set.insert x set)
 
 showTopStack :: Stack -> String
-showTopStack = maybe "<unknown>" show . topStack
+showTopStack = maybe "<unknown>" id . topStack
 
-topStack :: Stack -> Maybe Key
+topStack :: Stack -> Maybe String
 topStack (Stack key _ _) = key
 
 checkStack :: [Id] -> Stack -> Maybe Id
@@ -81,7 +82,7 @@ data BuiltinResult value
     } deriving (Typeable, Functor)
 
 -- local variables of rules
-data Local = Local
+data Local k = Local
     -- constants
     {localStack :: Stack
     -- stack scoped local variables
@@ -91,11 +92,10 @@ data Local = Local
     ,localDepends :: Depends -- built up in reverse
     ,localDiscount :: !Seconds
     ,localTraces :: [Trace] -- in reverse
-    ,localTrackAllows :: [Key -> Bool]
-    ,localTrackUsed :: [Key]
+    ,localTrackAllows :: [k -> Bool]
+    ,localTrackUsed :: [k]
     }
 
-newLocal :: Stack -> Verbosity -> Local
+newLocal :: Stack -> Verbosity -> Local k
 newLocal stack verb = Local stack verb Nothing mempty 0 [] [] []
-
 

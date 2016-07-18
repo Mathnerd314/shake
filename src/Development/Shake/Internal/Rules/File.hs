@@ -52,7 +52,7 @@ newtype FileQ = FileQ {fromFileQ :: BSU}
 
 instance Show FileQ where show (FileQ x) = unpackU x
 
-data FileA = FileA { mod :: {-# UNPACK #-} !ModTime, size :: {-# UNPACK #-} !FileSize, digest :: {-# UNPACK #-} !FileHash }
+data FileA = FileA { mod :: {-# UNPACK #-} !ModTime, sizeF :: {-# UNPACK #-} !FileSize, digest :: {-# UNPACK #-} !FileHash }
     deriving (Typeable,Eq,Show,Generic)
 
 instance Hashable FileA
@@ -77,7 +77,7 @@ compareFileA :: Change -> FileQ -> Maybe FileA -> Maybe FileA -> IO Bool
 compareFileA _ _ Nothing _ = return False
 compareFileA _ _ (Just vo) (Just vn) | vo == vn = return True
 compareFileA sC (FileQ x) (Just oldinfo@(FileA ytime ysize yhash)) vn = do
-    res <- maybe (getFileInfo x) (return . Just . (mod &&& size)) vn
+    res <- maybe (getFileInfo x) (return . Just . (mod &&& sizeF)) vn
     case res of
         Nothing -> return $ oldinfo == missingFile
         Just (time,size) -> let m = time =?= ytime in case sC of
@@ -96,6 +96,8 @@ getFileA sC msg' (FileQ x) = getFileInfo x >>= \res -> case res of
     Just (time,size) -> case sC of
         ChangeModtime -> return (FileA time size FileNeq)
         _ -> FileA time size <$> getFileHash x
+
+-- handling symbolic links: if a -> b -> c, then this is also the dependency pattern. file rules should have a "SymLink FilePath" value based on lstat / readlink, and 'need' said FilePath.
 
 defaultRuleFile :: Rules ()
 defaultRuleFile = addBuiltinRule $ \x vo dep -> do
@@ -194,11 +196,11 @@ neededCheck (map (packU_ . filepathNormalise . unpackU_) -> xs) = do
 -}
 neededCheck (map (FileQ . packU_ . filepathNormalise . unpackU_) -> xs) = do
     ShakeOptions{..} <- getShakeOptions
+    outputCheck <- outputCheck
     parallel $ flip map xs $ \file -> do
         urule <- userRule fromFileRule file
         case urule of
             Nothing -> do
-                outputCheck <- outputCheck
                 (if outputCheck then id else orderOnlyAction) $ apply1 file :: Action FileA
             Just (Root{..}) -> blockApply ("'needed' file has file rule " ++ help ++ " defined") (apply1 file :: Action FileA)
     return ()

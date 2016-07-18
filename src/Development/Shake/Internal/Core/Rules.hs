@@ -1,34 +1,45 @@
-{-# LANGUAGE RecordWildCards, ScopedTypeVariables, PatternGuards #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving, DeriveFunctor, DeriveDataTypeable #-}
+{-# LANGUAGE RecordWildCards, ScopedTypeVariables, PatternGuards, ViewPatterns #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving, DeriveFunctor, DeriveDataTypeable, DeriveGeneric, DeriveAnyClass #-}
 {-# LANGUAGE ExistentialQuantification, RankNTypes, MultiParamTypeClasses, ConstraintKinds #-}
 
 module Development.Shake.Internal.Core.Rules(
-    Rules, runRules,
-    BuiltinRule(..), addBuiltinRule,
+    Action, apply, apply1,
+    Rules, runRules, ShakeValue(..),
+    BuiltinRule(..), addBuiltinRule, BuiltinResult(..),
     addUserRule, alternatives, priority,
     action, withoutActions
     ) where
 
+
 import Control.Applicative
-import Data.Tuple.Extra
+import Control.Exception.Extra
 import Control.Monad.Extra
 import Control.Monad.Fix
 import Control.Monad.IO.Class
 import Control.Monad.Trans.Writer.Strict
-import Data.Typeable.Extra
 import Data.Function
+import Data.IORef
 import Data.List.Extra
-import qualified Data.HashMap.Strict as Map
 import Data.Maybe
-import System.IO.Extra
 import Data.Monoid
+import Data.Tuple.Extra
+import Data.Typeable.Extra
+import GHC.Generics
+import General.Binary
+import System.IO.Extra
+import System.IO.Unsafe
+import qualified Data.ByteString.Char8 as BS
+import qualified Data.HashMap.Strict as Map
+import qualified Data.HashSet as Set
 
 import Development.Shake.Classes
 import Development.Shake.Internal.Core.Action
-import Development.Shake.Internal.Core.Database(BuildKey)
-import Development.Shake.Internal.Value
+import Development.Shake.Internal.Core.Database
+import Development.Shake.Internal.Core.Types
+import Development.Shake.Internal.Core.Run hiding (trackAllow)
 import Development.Shake.Internal.Types
 import Development.Shake.Internal.Errors
+
 import Prelude
 
 
@@ -109,10 +120,35 @@ import Prelude
 --   For rules whose values are not stored externally,
 --   'storedValue' should return 'Just' with a sentinel value
 --   and 'equalValue' should always return 'EqualCheap' for that sentinel.
-type BuiltinRule k v = BuildKey
+type BuiltinRule k v = BuildKey Key
 data BuiltinRule_ = forall k v. BuiltinRule_ (BuiltinRule k v)
 
 data UserRule_ = forall a . Typeable a => UserRule_ (UserRule a)
+
+-- correct - obvious for a deterministic build, not so clear otherwise, but the notion exists nonetheless
+-- consistent - all rules have been run successfully & have correct outputs. a 'clean build'
+--   a change from another process (or the user) creates an inconsistency
+-- sound - all inconsistency is unstable/temporary & disappears after re-running the build tool
+--  opposite: stable inconsistency - "stuck", running build tool again does not restore consistency, incorrect outputs remain incorrect
+-- A proper build tool is sound
+--   Shake will still keep stale top-level outputs, and their dependencies; they can be deleted with --prune.
+--   However, it will delete intermediate generated files if they are unused.
+--   Shake will not re-run rules in the middle of a run unless the file monitor is enabled
+
+
+-- * external state is tracked by the build system
+--   An action cannot execute dependencies after reading an external datum; you must move the read operation to a new rule if you wish to execute further keys.
+-- * external state is minimized
+--   Once the datum is read, it must not change for the rest of the build run.
+-- * The build result does not depend on the previous external state
+--   If an external datum is modified, then every rule reading that datum must execute afterwards.
+
+
+-- Shake supports 4 methods for the generated-file, dynamic-file-list problem; listed from most efficient to least efficient:
+-- 1. Direct dependency: the file list action is given a-priori knowledge to call the generator action.
+-- 2. Interleaved execution: the file list action scans the files, runs plausible generating actions untracked (perhaps with orderOnly), and writes a dependency list a-posteriori.
+-- 3. Weak dependency: sequential ordering of dependencies ensures that all relevant generated files are created before the file list is built
+-- 4. Eventual consistency: the filesystem is monitored, regenerating the list on every update; any rules depending on the list are added to a pending queue which is run periodically. Eventually, if all goes well, all files will be generated and the system will stabilize.
 
 
 -- | A 'Match' data type, representing user-defined rules associated with a particular type.
@@ -259,7 +295,7 @@ addUserRule r = newRules mempty{userRules = Map.singleton (typeOf r) $ UserRule_
 --   own (logical) clock for tracking dependencies.
 --
 addBuiltinRule :: (ShakeValue key, ShakeValue value) => BuiltinRule key value -> Rules ()
-addBuiltinRule (b :: BuildKey) = newRules mempty{builtinRules = Map.singleton k $ BuiltinRule_ b}
+addBuiltinRule (b :: BuildKey Key) = newRules mempty{builtinRules = Map.singleton k $ BuiltinRule_ b}
     where k = typeRep (Proxy :: Proxy key)
 
 
@@ -347,7 +383,7 @@ withoutActions :: Rules () -> Rules ()
 withoutActions = modifyRules $ \x -> x{actions=[]}
 
 
-runRules :: ShakeOptions -> Rules () -> IO ([Action ()], Global -> BuildKey, Witness)
+runRules :: ShakeOptions -> Rules () -> IO ([Action ()], Global Key -> BuildKey Key, Witness)
 runRules opts r = do
     srules <- getRules r
     return (actions srules, createRuleinfo opts srules, registerWitnesses srules)
@@ -357,10 +393,10 @@ runRules opts r = do
         forM_ (Map.elems builtinRules) $ registerWitness (Proxy :: Proxy k) (Proxy :: Proxy v)
 
 
-    createRuleinfo :: ShakeOptions -> SRules -> Map.HashMap TypeRep BuildKey
+    createRuleinfo :: ShakeOptions -> SRules -> Map.HashMap TypeRep (BuildKey Key)
     createRuleinfo opt SRules{..} = flip Map.map builtinRules $ (typeRep (Proxy :: Proxy v))
 
-runKey :: Global -> BuildKey
+runKey :: Global Key -> BuildKey Key
 runKey global@Global{globalOptions=ShakeOptions{..},..} stack step k r dirtyChildren continue = do
     time <- liftIO $ offsetTime
     let s = newLocal stack shakeVerbosity
@@ -369,7 +405,7 @@ runKey global@Global{globalOptions=ShakeOptions{..},..} stack step k r dirtyChil
         let tk = typeKey k
         case Map.lookup tk globalRules of
             Nothing -> liftIO $ errorNoRuleToBuildType tk (Just $ show k) Nothing
-            Just BuiltinRule{..} -> do
+            Just BuiltinRule_{} -> do
                 liftIO $ evaluate $ rnf k
                 liftIO $ globalLint $ "before building " ++ top
                 putWhen Chatty $ "# " ++ show k
@@ -396,9 +432,43 @@ runKey global@Global{globalOptions=ShakeOptions{..},..} stack step k r dirtyChil
                             Right x -> return x
                 ) continue
 
+-- To substitute a key:
+-- 1. Verify substitute available & valid
+-- 2. Download result into cache
+-- 3. Read dependencies, substitute dependencies
+-- 4. Deserialize result and update database
+
+-- this doesn't particularly support filling a substitute dependency with a non-substitute;
+-- instead, create those locally:
+-- 1. build key normally
+-- 2. hash results + hash of dependencies
+-- 3. sign, pack, add to cache
+
+-- to build remotely:
+-- 1. check that client/server are compatible
+-- 2. send key to server
+-- 3. server checks & runs rule
+-- 4. client waits for requests
+-- 5. keys know how to send/receive/compose external state
+
+-- fileSource = do
+--   etag_nb <- readLocal
+--   when server $ do
+--     send clientSock (Request key etag_nb)
+--     r <- recv
+--     mbWrite r
+--   when client $ do
+--     Request key etag <- recv
+--     case comp etag_nb etag of
+--       Match -> send successful
+--       Fixable -> send fixData
+--       Error -> send error
+
+type Action = ActionP Key
+
 data Key = Key
   { typeKey :: TypeRep
-  , keyString :: Value
+  , keyString :: ByteString
   }
     deriving (Typeable,Eq,Show,Hashable,NFData,Generic)
 
@@ -491,3 +561,106 @@ instance Store Witness where
             {-# NOINLINE readIORefAfter #-}
             readIORefAfter :: a -> IORef b -> IO b
             readIORefAfter v ref = v `seq` readIORef ref
+
+-- | Define an alias for the six type classes required for things involved in Shake rules.
+--   Using this alias requires the @ConstraintKinds@ extension.
+--
+--   To define your own values meeting the necessary constraints it is convenient to use the extensions
+--   @GeneralizedNewtypeDeriving@ and @DeriveDataTypeable@ to write:
+--
+-- > newtype MyType = MyType (String, Bool) deriving (Show, Typeable, Eq, Hashable, Store, NFData)
+--
+--   Shake needs these instances on keys. They are used for:
+--
+-- * 'Show' is used to print out keys in errors, profiling, progress messages
+--   and diagnostics.
+--
+-- * 'Typeable' is used because Shake indexes its database by the
+--   type of the key involved in the rule (overlap is not
+--   allowed for type classes and not allowed in Shake either);
+--   this lets Shake implement built-in rules
+--
+-- * 'Eq' and 'Hashable' are used on keys in order to build hash maps
+--   from keys to values. The 'Hashable' instances are only use at
+--   runtime (never serialised to disk),
+--   so they do not have to be stable across runs.
+--
+-- * 'Store' is used to serialize keys to and from Shake's build database
+--
+-- * 'NFData' is used to avoid space and thunk leaks, especially
+--   when Shake is parallelized.
+type ShakeValue a = (Show a, Typeable a, Eq a, Hashable a, Store a, NFData a)
+
+-- To simplify journaling etc we smuggle the Step in the database, with a special StepKey
+newtype StepKey = StepKey ()
+    deriving (Show,Eq,Typeable,Hashable,Store,NFData)
+
+stepKey :: Key
+stepKey = newKey $ StepKey ()
+
+toStepResult :: Step -> (LiveResult, Result)
+toStepResult i = err "Step does not have a value"
+  Result (encode i) i i mempty 0
+
+fromStepResult :: Result -> Step
+fromStepResult = decode . result
+
+-- | Execute a rule, returning the associated values. If possible, the rules will be run in parallel.
+--   This function requires that appropriate rules have been added with 'rule'.
+--   All @key@ values passed to 'apply' become dependencies of the 'Action'.
+apply :: (ShakeValue key, ShakeValue value) => [key] -> Action [value]
+apply = applyForall
+
+-- | Return the values associated with an already-executed rule, throwing an error if the
+--   rule would need to be re-run.
+--   This function requires that appropriate rules have been added with 'rule'.
+--   All @key@ values passed to 'applied' become dependencies of the 'Action'.
+applied :: (ShakeValue key, ShakeValue value) => [key] -> Action [value]
+applied ks = blockApply "'applied' key" (applyForall ks)
+
+-- We don't want the forall in the Haddock docs
+-- Don't short-circuit [] as we still want error messages
+applyForall :: forall key value . (ShakeValue key, ShakeValue value) => [key] -> Action [value]
+applyForall ks = do
+    let tk = typeOf (err "apply key" :: key)
+        tv = typeOf (err "apply type" :: value)
+    Global{..} <- Action getRO
+    -- this duplicates the check in runKey, but we can give better error messages here
+    case Map.lookup tk globalRules of
+        Nothing -> liftIO $ errorNoRuleToBuildType tk (show <$> listToMaybe ks) (Just tv)
+        _ -> return ()
+    vs <- applyKeyValue (map newKey ks)
+    let f k (resultValue -> v) = case fromDynamic v of
+            Just v -> return v
+            Nothing -> liftIO $ errorRuleTypeMismatch tk (Just $ show k) (dynTypeRep v) tv
+    zipWithM f ks vs
+
+-- | Apply a single rule, equivalent to calling 'apply' with a singleton list. Where possible,
+--   use 'apply' to allow parallelism.
+apply1 :: (ShakeValue key, ShakeValue value) => key -> Action value
+apply1 = fmap head . apply . return
+
+run :: ShakeOptions -> Rules () -> IO ()
+run opts@ShakeOptions{..} rs = (if shakeLineBuffering then lineBuffering else id) $ do
+    opts@ShakeOptions{..} <- if shakeThreads /= 0 then return opts else do p <- getProcessorCount; return opts{shakeThreads=p}
+    start <- offsetTime
+    (actions, ruleinfo) <- runRules opts rs
+    run' opts actions ruleinfo
+--     registerWitness (undefined :: StepKey)
+--     witness <- currentWitness
+--         stepId <- internKey intern stepKey
+--         let step = case Map.lookup stepId oldstatus of
+--                         Just (_,r) -> incStep . fromStepResult $ r
+--                         _ -> initialStep
+--             stepResult = toStepResult step
+--             stepId (stepKey, Ready stepResult)
+--             journal stepId (stepKey, resultStore stepResult)
+
+-- | Allow any matching key to violate the tracking rules.
+trackAllow :: (ShakeValue key) => (key -> Bool) -> Action ()
+trackAllow test = trackAllowForall
+    where
+        tk = typeOf (err "trackAllow key" :: key)
+        f :: (key -> Bool) -> ActionP key ()
+        f k = typeKey k == tk && fmap test (fromKey k) == Just True
+

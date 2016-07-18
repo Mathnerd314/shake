@@ -29,7 +29,7 @@ infix 1 &?>, &%>
 
 
 newtype FilesQ = FilesQ [FileQ]
-    deriving (Typeable,Eq,Hashable,Binary,NFData)
+    deriving (Typeable,Eq,Hashable,Store,NFData)
 
 instance Show FilesQ where show (FilesQ xs) = unwords $ map (wrapQuote . show) xs
 

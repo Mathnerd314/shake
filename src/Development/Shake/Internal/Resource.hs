@@ -1,26 +1,26 @@
 {-# LANGUAGE RecordWildCards, ViewPatterns, DeriveDataTypeable, DeriveGeneric #-}
 
 module Development.Shake.Internal.Resource(
-    Resource, newResourceIO, newThrottleIO, acquireResource, releaseResource
+    Resource, newResource, newThrottle, acquireResource, releaseResource
     ) where
 
-import Data.Function
-import System.IO.Unsafe
+
 import Control.Concurrent.Extra
 import Control.Exception.Extra
-import Data.Tuple.Extra
 import Control.Monad
-import General.Bilist
-import Development.Shake.Internal.Core.Pool
-import System.Time.Extra
+import Control.Monad.IO.Class
+import Data.Function
 import Data.Monoid
-import Prelude
-import Control.Monad
+import Data.Tuple.Extra
 import Data.Typeable
+import Development.Shake.Internal.Core.Pool
 import GHC.Generics
-import qualified Data.HashMap.Strict as Map
+import General.Bilist
+import Prelude
+import System.IO.Unsafe
 import System.Random
-
+import System.Time.Extra
+import qualified Data.HashMap.Strict as Map
 ---------------------------------------------------------------------
 -- UNFAIR/RANDOM QUEUE
 
@@ -139,10 +139,37 @@ data Finite = Finite
         -- ^ queue of people with how much they want and the action when it is allocated to them
     }
 
--- | A version of 'Development.Shake.newResource' that runs in IO, and can be called before calling 'Development.Shake.shake'.
---   Most people should use 'Development.Shake.newResource' instead.
-newResourceIO :: String -> Int -> IO Resource
-newResourceIO name mx = do
+-- | Create a finite resource, given a name (for error messages) and a quantity of the resource that exists.
+--   Shake will ensure that actions using the same finite resource do not execute in parallel.
+--   As an example, only one set of calls to the Excel API can occur at one time, therefore
+--   Excel is a finite resource of quantity 1. You can write:
+--
+-- @
+-- 'Development.Shake.shake' 'Development.Shake.shakeOptions'{'Development.Shake.shakeThreads'=2} $ do
+--    'Development.Shake.want' [\"a.xls\",\"b.xls\"]
+--    excel <- 'Development.Shake.newResource' \"Excel\" 1
+--    \"*.xls\" 'Development.Shake.%>' \\out ->
+--        'Development.Shake.withResource' excel 1 $
+--            'Development.Shake.cmd' \"excel\" out ...
+-- @
+--
+--   Now the two calls to @excel@ will not happen in parallel.
+--
+--   As another example, calls to compilers are usually CPU bound but calls to linkers are usually
+--   disk bound. Running 8 linkers will often cause an 8 CPU system to grid to a halt. We can limit
+--   ourselves to 4 linkers with:
+--
+-- @
+-- disk <- 'Development.Shake.newResource' \"Disk\" 4
+-- 'Development.Shake.want' [show i 'Development.Shake.FilePath.<.>' \"exe\" | i <- [1..100]]
+-- \"*.exe\" 'Development.Shake.%>' \\out ->
+--     'Development.Shake.withResource' disk 1 $
+--         'Development.Shake.cmd' \"ld -o\" [out] ...
+-- \"*.o\" 'Development.Shake.%>' \\out ->
+--     'Development.Shake.cmd' \"cl -o\" [out] ...
+-- @
+newResource :: (MonadIO m) => String -> Int -> m Resource
+newResource name mx = liftIO $ do
     when (mx < 0) $
         errorIO $ "You cannot create a resource named " ++ name ++ " with a negative quantity, you used " ++ show mx
     key <- resourceId
@@ -210,10 +237,37 @@ data Throttle
     | ThrottleWaiting (IO ()) (Bilist (Int, IO ()))
 
 
--- | A version of 'Development.Shake.newThrottle' that runs in IO, and can be called before calling 'Development.Shake.shake'.
---   Most people should use 'Development.Shake.newThrottle' instead.
-newThrottleIO :: String -> Int -> Double -> IO Resource
-newThrottleIO name count period = do
+-- | Create a throttled resource, given a name (for error messages) and a number of resources (the 'Int') that can be
+--   used per time period (the 'Double' in seconds). Shake will ensure that actions using the same throttled resource
+--   do not exceed the limits. As an example, let us assume that making more than 1 request every 5 seconds to
+--   Google results in our client being blacklisted, we can write:
+--
+-- @
+-- google <- 'Development.Shake.newThrottle' \"Google\" 1 5
+-- \"*.url\" 'Development.Shake.%>' \\out -> do
+--     'Development.Shake.withResource' google 1 $
+--         'Development.Shake.cmd' \"wget\" [\"http:\/\/google.com?q=\" ++ 'Development.Shake.FilePath.takeBaseName' out] \"-O\" [out]
+-- @
+--
+--   Now we will wait at least 5 seconds after querying Google before performing another query. If Google change the rules to
+--   allow 12 requests per minute we can instead use @'Development.Shake.newThrottle' \"Google\" 12 60@, which would allow
+--   greater parallelisation, and avoid throttling entirely if only a small number of requests are necessary.
+--
+--   In the original example we never make a fresh request until 5 seconds after the previous request has /completed/. If we instead
+--   want to throttle requests since the previous request /started/ we can write:
+--
+-- @
+-- google <- 'Development.Shake.newThrottle' \"Google\" 1 5
+-- \"*.url\" 'Development.Shake.%>' \\out -> do
+--     'Development.Shake.withResource' google 1 $ return ()
+--     'Development.Shake.cmd' \"wget\" [\"http:\/\/google.com?q=\" ++ 'Development.Shake.FilePath.takeBaseName' out] \"-O\" [out]
+-- @
+--
+--   However, the rule may not continue running immediately after 'Development.Shake.withResource' completes, so while
+--   we will never exceed an average of 1 request every 5 seconds, we may end up running an unbounded number of
+--   requests simultaneously. If this limitation causes a problem in practice it can be fixed.
+newThrottle :: (MonadIO m) => String -> Int -> Double -> m Resource
+newThrottle name count period = liftIO $ do
     when (count < 0) $
         errorIO $ "You cannot create a throttle named " ++ name ++ " with a negative quantity, you used " ++ show count
     key <- resourceId
@@ -249,3 +303,26 @@ newThrottleIO name count period = do
                     | i >= wi = second (wa >>) $ f stop (i-wi) ws
                     | otherwise = (ThrottleWaiting stop $ (wi-i,wa) `cons` ws, return ())
                 f stop i _ = (ThrottleAvailable i, stop)
+
+-- More resource types:
+-- token bucket / leaky bucket: infrequent bursts of calls and a maximum average rate. The bucket size is 40 calls, with a "leak rate" of 2 calls per second that continually empties the bucket. If your app averages 2 calls per second, it will not overflow; if it is more, the bucket will fill up and eventually overflow.
+--
+-- Sliding window that is updated every few minutes. 480,000 calls can be made in a 24-hour period.
+--
+-- limit-remaining-reset (is this the current throttle?)
+--
+-- Hourly API usage is tracked from the start of one-hour to start of the next hour. If the API call rate limit is reached, you will receive an exception for each call until the start of the next hour (this can be up to 60 minutes). The exception message states: “The maximum number of hourly API invocations has been exceeded” (error number 207).
+--
+--
+--     The algorithm and data structure I chose was straightforward.
+--     I keep a timestamp log of requests in a Redis list data type which allows fast appending and trimming of elements.
+-- As an example, I will use the table below to show the timestamps of five previous requests.
+-- Requests ago 	1 	2 	3 	4 	5
+-- Timestamp 	12:34:28 	12:34:26 	12:34:14 	12:33:37 	12:33:35
+--
+-- If I have two rules of 1 per second and 5 per minute, I grab the 1st and 5th timestamps representing the last request and 5 requests ago.
+-- If the 1st timestamp is less than 1 second old the first rate limit rule will fail. Likewise if the 5th timestamp is less than 1 minute old the second rule fails.
+-- At 12:34:31 the first timestamp is 3 seconds old, but the 5th timestamp is only 56 seconds old triggering the second rule. We could calculate we need to wait 4 seconds before trying again.
+-- At 12:34:40 the first rule passes as it is 12 seconds old, the second rule also passes as it is now 65 seconds old.
+
+-- GCRA

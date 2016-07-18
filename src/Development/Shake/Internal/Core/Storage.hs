@@ -13,7 +13,6 @@ import General.Binary
 import Data.Store(decodeEx)
 import General.Intern
 import Development.Shake.Internal.Types
-import Development.Shake.Internal.Value
 import General.Timing
 import General.FileLock
 import qualified General.Ids as Ids
@@ -57,7 +56,7 @@ withStorage
     => ShakeOptions             -- ^ Storage options
     -> (IO String -> IO ())        -- ^ Logging function
     -> w                        -- ^ Witness
-    -> (Ids.Ids Value -> (Id -> Value -> IO ()) -> IO a)  -- ^ Execute
+    -> (Ids.Ids ByteString -> (Id -> ByteString -> IO ()) -> IO a)  -- ^ Execute
     -> IO a
 withStorage ShakeOptions{..} diagnostic witness act = withLockFileDiagnostic diagnostic (shakeFiles </> ".shake.lock") $ do
     let dbfile = shakeFiles </> ".shake.database"

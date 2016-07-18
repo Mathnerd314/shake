@@ -36,7 +36,7 @@ Assuming all interesting headers are only included directly by the C file (a res
         cmd "gcc -c" [c] "-o" [out]
 
 
-This code calls `readFile'` (which automatically calls `need` on the source file), then uses calls `need` on all headers used by the source file, then calls `gcc`. All files have `need` called on them before they are used, so if the C file or any of the header files have build system rules they will be run. 
+This code calls `readFile'` (which automatically calls `need` on the source file), then uses calls `need` on all headers used by the source file, then calls `gcc`. All files have `need` called on them before they are used, so if the C file or any of the header files have build system rules they will be run.
 
 #### Generated transitive imports
 
@@ -63,3 +63,49 @@ For simplicity, this code assumes all files are in a single directory and all ob
 * The `*.o` rule reads the associated `.deps` file (ensuring it is up to date) and then depends on its contents.
 
 The pattern of `*.deps` files occurs frequently, for example when linking Haskell files.
+
+problem:
+type command, automatically resolve and download and install and run the program(s) needed for the command
+solution:
+library which suspends process until dependency is resolved, + database of all the dependencies and how to install them
+MikTeX already has a hook like this in TeX for package dependencies, extending it to interface with Shake & file rules (so e.g. requesting a .png file will either 'need' the corresponding .svg file or wait until it is generated) does not seem too hard
+
+### Fortran module dependencies
+must be resolved before we start the f95 process
+
+    compile bar.f90
+      read bar.f90
+      find foo.mod >>= read
+      f95 bar.f90
+      output bar.o bar.mod
+
+    find foo.mod
+      look in search path (directories and archives) - results cached
+      if not found, sleep until it appears
+        timeout - throw error
+        appears - recheck search path
+
+    compile foo.90
+      read foo.f90
+      -- assume no module dependencies
+      f95 foo.f90
+      output foo.o foo.mod
+      wake up foo.mod sleepers
+
+ensure that:
+- bar.f90 never compiles before foo.f90
+- bar.f90 recompiles when foo.mod changes
+
+cyclic module dependencies are not supported in Fortran; so in general the sleeping approach works, as long as all needed modules are eventually compiled
+
+### GHC "source" imports
+See issue #454.
+
+    ghc -c -dynamic ModuleA.hs-boot -- generates A.o-boot
+    ghc -c -dynamic ModuleB.hs      -- generates B.o, consumes A.o-boot
+    ghc -c -dynamic ModuleA.hs      -- generates A.o, consumes B.o
+    ghc -c ModuleC.hs               -- generates C.o, consumes A.o B.o
+    ghc -o foo A.o B.o C.o
+
+  similarly, there is no cyclic dependency here, it is "unrolled" by the boot process; the hard part is the implicit dependency of C on A
+

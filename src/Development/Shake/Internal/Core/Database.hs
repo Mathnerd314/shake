@@ -14,7 +14,6 @@ import GHC.Generics (Generic)
 import Development.Shake.Classes
 import General.Binary
 import Development.Shake.Internal.Core.Pool
-import Development.Shake.Internal.Value
 import Development.Shake.Internal.Errors
 import Development.Shake.Internal.Core.Storage
 import Development.Shake.Internal.Types
@@ -37,9 +36,6 @@ import qualified Data.HashMap.Strict as Map
 import qualified General.Ids as Ids
 import Data.Typeable.Extra
 
-import Data.Binary.Get
-import Data.Binary.Put
-
 import Data.IORef.Extra
 import Data.Dynamic
 import Data.Maybe
@@ -55,15 +51,15 @@ type Map = Map.HashMap
 ---------------------------------------------------------------------
 -- CENTRAL TYPES
 
-type InternDB = IORef (Intern Key)
+type InternDB k = IORef (Intern k)
 
--- | Invariant: The database does not have any cycles where a Key depends on itself
-data Database = Database
+-- | Invariant: The database does not have any cycles where a Key depends (directly or indirectly) on itself
+data Database k = Database
     {lock :: Lock
-    ,intern :: InternDB
-    ,status :: Ids.Ids (Key, Status)
+    ,intern :: InternDB k
+    ,status :: Ids.Ids (k, Status)
     ,step :: {-# UNPACK #-} !Step
-    ,journal :: Id -> Key -> Result -> IO ()
+    ,journal :: Id -> k -> Result -> IO ()
     ,diagnostic :: IO String -> IO () -- ^ logging function
     }
 
@@ -72,10 +68,11 @@ data Status
     | Error SomeException -- ^ I have been run and raised an error
     | Waiting (Waiting Status) -- ^ Checking/building subdependencies
                                -- The Waiting is called only with Ready or Error
+    | Loaded Result -- ^ Stored value
       deriving Show
 
 data Result = Result
-    {resultStore :: Value -- ^ the result to store for the Key
+    {resultStore :: {-# UNPACK #-} !ByteString -- ^ the result to store for the Key
     ,built :: {-# UNPACK #-} !Step -- ^ when it was actually run
     ,changed :: {-# UNPACK #-} !Step -- ^ the step for deciding if it's valid
     ,depends :: Depends -- ^ dependencies (stored in order of appearance; don't run them early)
@@ -97,16 +94,16 @@ instance NFData Dynamic where
 ---------------------------------------------------------------------
 -- OPERATIONS
 
-type BuildKey
+type BuildKey k
          = Stack -- Given the current stack with the key added on
         -> Step -- And the current step
-        -> Key -- The key to build
+        -> k -- The key to build
         -> Maybe Result -- A previous result, or Nothing if never been built before
         -> Bool -- True if any of the children were dirty
         -> Capture (Either SomeException (Bool, Result))
             -- Either an error, or a result.
 
-internKey :: InternDB -> Key -> IO Id
+internKey :: InternDB k -> k -> IO Id
 internKey intern k = do
     is <- readIORef intern
     case Intern.lookup k is of
@@ -118,7 +115,7 @@ internKey intern k = do
 
 atom x = let s = show x in if ' ' `elem` s then "(" ++ s ++ ")" else s
 
-updateStatus :: Database -> Id -> Key -> Status -> IO ()
+updateStatus :: Database k -> Id -> k -> Status -> IO ()
 updateStatus Database{..} i k v done = do
     -- this can only be full if we're called from reportResult
     (oldk,oldv) <- fmap fst &&& fmap snd <$> Ids.lookup status i
@@ -140,7 +137,7 @@ buildResult Local{..} r = do
     return (ans, ansSto)
 
 
-reportResult :: Database -> Id -> Key -> Either SomeException (LiveResult, Result) -> IO ()
+reportResult :: Database k -> Id -> k -> Either SomeException (LiveResult, Result) -> IO ()
 reportResult d@Database{..} i k x = do
     res <- case x of
         Left e -> Error e
@@ -162,7 +159,7 @@ reportResult d@Database{..} i k x = do
 -- getCached :: StatusDB -> Id -> Status
 -- getCached status i = Ids.lookup status i (\(_, res) -> return res)
 
-showStack :: Database -> [Id] -> IO [String]
+showStack :: Database k -> [Id] -> IO [String]
 showStack Database{..} xs = do
     forM (reverse xs) $ \x ->
         maybe "<unknown>" (show . fst) <$> Ids.lookup status x
@@ -171,10 +168,19 @@ showStack Database{..} xs = do
 -- 'build' first takes the state lock and (on a single thread) performs as many transitions as it can without waiting on a mutex or running any rules.
 -- Then it releases the state lock and runs the rules in the thread pool and waits for all of them to finish
 -- A build requiring no rules should not result in any thread contention.
-build :: Pool -> Database -> BuildKey -> Stack -> [Key] -> Capture (Depends,Answer (Either SomeException [LiveResult]))
+
+-- single threaded avoids locks and thread contention
+-- parallelism spawns many threads - thread pool, shakeThreads
+-- could have a mutex for each key to allow other threads to wait for a result to become available - instead, Shake has a single global state lock
+-- When a rule is blocked in build, waiting for dependencies to become available, we temporarily spawn another worker
+-- In order to reduce contention between processes, we run tasks in a random order
+-- a deterministic order could always run all compilers followed by all linkers, resulting in lots of resource contention
+-- - but now shake has resources, is this still necessary?
+
+build :: Pool -> Database k -> BuildKey k -> Stack -> [k] -> Capture (Depends,Answer (Either SomeException [LiveResult]))
 build pool database@Database{..} runKey stack ks continue =
     withLock lock $ do
-        is <- forM ks $ internKey intern
+        is <- forM ks $ internKey database
 
         whenJust (checkStack is stack) $ \bad -> do
             -- everything else gets thrown via Left and can be Staunch'd
@@ -209,7 +215,7 @@ build pool database@Database{..} runKey stack ks continue =
             errorNoReference stackStr (show i)
 
         -- | Given a Key and the dependencies yet to be checked, check the dependencies then run the key
-        check :: Stack -> Id -> Key -> Result -> [[Id]] -> IO Status {- Waiting -}
+        check :: Stack -> Id -> k -> Result -> [[Id]] -> IO Status {- Waiting -}
         check stack i k r [] = spawn False stack i k $ Just r
         check stack i k r (ds:rest) = do
             let cont v = if isLeft v then spawn True stack i k $ Just r else check stack i k r rest
@@ -233,7 +239,7 @@ build pool database@Database{..} runKey stack ks continue =
                     return w
 
         -- | Given a Key, queue up execution and return waiting
-        spawn :: Bool -> Stack -> Id -> Key -> Maybe Result -> IO Status {- Waiting -}
+        spawn :: Bool -> Stack -> Id -> k -> Maybe Result -> IO Status {- Waiting -}
         spawn dirtyChildren stack i k r = do
             diagnostic $ "dirty " ++ show dirtyChildren ++ " for " ++ atom k ++ " " ++ atom r
             w <- Waiting =<< newWaiting
@@ -244,7 +250,7 @@ build pool database@Database{..} runKey stack ks continue =
 ---------------------------------------------------------------------
 -- PROGRESS
 
-progress :: Database -> IO Progress
+progress :: Database k -> IO Progress
 progress Database{..} = do
     xs <- Ids.toList status
     return $! foldl' f mempty $ map (snd . snd) xs
@@ -266,7 +272,7 @@ progress Database{..} = do
 ---------------------------------------------------------------------
 -- QUERY DATABASE
 
-assertFinishedDatabase :: Database -> IO ()
+assertFinishedDatabase :: Database k -> IO ()
 assertFinishedDatabase Database{..} = do
     -- if you have anyone Waiting, and are not exiting with an error, then must have a complex recursion (see #400)
     status <- Ids.toList status
@@ -308,7 +314,7 @@ dependencyOrder shw status = f (map fst noDeps) $ Map.map Just $ Map.fromListWit
 
 
 -- | Eliminate all waiting / error from the database, pretending they don't exist
-resultsOnly :: Map Id (Key, Status) -> Map Id (Key, LiveResult)
+resultsOnly :: Map i (k, Status) -> Map i (k, LiveResult)
 resultsOnly mp = Map.map (second f) keep
     where
       keep = Map.filter (isJust . getResult . snd) mp
@@ -320,10 +326,10 @@ resultsOnly mp = Map.map (second f) keep
       getResult (Ready r) = Just r
       getResult _ = Nothing
 
-removeStep :: Map Id (Key, LiveResult) -> Map Id (Key, LiveResult)
+removeStep :: Map Id (k, LiveResult) -> Map Id (k, LiveResult)
 removeStep = Map.filter (\(k,_) -> k /= stepKey)
 
-toReport :: Database -> IO [ProfileEntry]
+toReport :: Database k -> IO [ProfileEntry]
 toReport Database{..} = do
     status <- removeStep . resultsOnly <$> Ids.toMap status
     let order = let shw i = maybe "<unknown>" (show . fst) $ Map.lookup i status
@@ -345,7 +351,7 @@ toReport Database{..} = do
     return [maybe (err "toReport") f $ Map.lookup i status | i <- order]
 
 
-checkValid :: Database -> [(Key, Key)] -> ([(Id, (Key, LiveResult))] -> IO [(Key, Value, String)]) -> IO ()
+checkValid :: Database k -> [(k, k)] -> ([(Id, (k, LiveResult))] -> IO [(k, ByteString, String)]) -> IO ()
 checkValid Database{..} missing keyCheck = do
     intern <- readIORef intern
     diagnostic $ return "Starting validity/lint checking"
@@ -371,20 +377,20 @@ checkValid Database{..} missing keyCheck = do
     diagnostic $ return "Validity/lint check passed"
 
 
-listLive :: Database -> IO [Key]
+listLive :: Database k -> IO [k]
 listLive Database{..} = do
     diagnostic $ return "Listing live keys"
     status <- Ids.toList status
     return [k | (_, (k, Ready{})) <- status]
 
 
-listDepends :: Database -> Depends -> IO [Key]
+listDepends :: Database k -> Depends -> IO [k]
 listDepends Database{..} (Depends xs) =
     withLock lock $ do
         forM xs $ \x ->
             fst . fromJust <$> Ids.lookup status x
 
-lookupDependencies :: Database -> Key -> IO [Key]
+lookupDependencies :: Database k -> k -> IO [k]
 lookupDependencies Database{..} k =
     withLock lock $ do
         intern <- readIORef intern
@@ -397,36 +403,14 @@ lookupDependencies Database{..} k =
 ---------------------------------------------------------------------
 -- STORAGE
 
--- To simplify journaling etc we smuggle the Step in the database, with a special StepKey
-newtype StepKey = StepKey ()
-    deriving (Show,Eq,Typeable,Hashable,Store,NFData)
-
-stepKey :: Key
-stepKey = newKey $ StepKey ()
-
-toStepResult :: Step -> (LiveResult, Result)
-toStepResult i = err "Step does not have a value"
-  Result (encode i) i i mempty 0
-
-fromStepResult :: Result -> Step
-fromStepResult = decode . result
-
-withDatabase :: ShakeOptions -> (IO String -> IO ()) -> (Database -> IO a) -> IO a
-withDatabase opts diagnostic act = do
-    registerWitness (undefined :: StepKey)
-    witness <- currentWitness
-    withStorage opts diagnostic witness $ \mp2 journal' -> do
-        let journal i (k,v) = journal' (encode i) (encode (runPut $ putKeyWith witness k,v))
-            unpack (i,t) = (decode i, case decode t of (k,s) -> (runGet (getKeyWith witness) k, s))
+withDatabase :: ShakeOptions -> (IO String -> IO ()) -> w -> (k -> ByteString) -> (ByteString -> k) -> (Database k -> IO a) -> IO a
+withDatabase opts diagnostic witness writeKey readKey act = do
+    withStorage opts diagnostic witness $ \mp2 journal' step -> do
+        let journal i (k,v) = journal' (encode i) (encode (writeKey k,v))
+            unpack (i,t) = (decode i, case decode t of (k,s) -> (readKey k, s))
         let oldstatus = Map.fromList . map unpack $ Map.toList mp2
             mp1 = Intern.fromList [(k, i) | (i, (k,_)) <- Map.toList oldstatus]
         intern <- newIORef mp1
-        stepId <- internKey intern stepKey
-        let step = case Map.lookup stepId oldstatus of
-                        Just (_,r) -> incStep . fromStepResult $ r
-                        _ -> initialStep
-            stepResult = toStepResult step
-        status <- newIORef $ Map.singleton stepId (stepKey, Ready stepResult)
-        journal stepId (stepKey, resultStore stepResult)
+        status <- newIORef $ Map.empty
         lock <- newLock
         act Database{..}

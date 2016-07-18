@@ -154,7 +154,6 @@ library
         Development.Shake.Internal.Special
         Development.Shake.Internal.Core.Storage
         Development.Shake.Internal.Types
-        Development.Shake.Internal.Value
         General.Bilist
         General.Binary
         General.Cleanup
@@ -253,7 +252,6 @@ executable shake
         Development.Shake.Internal.Special
         Development.Shake.Internal.Core.Storage
         Development.Shake.Internal.Types
-        Development.Shake.Internal.Value
         General.Bilist
         General.Binary
         General.Cleanup
@@ -361,7 +359,6 @@ test-suite shake-test
         Development.Shake.Internal.Core.Storage
         Development.Shake.Internal.Types
         Development.Shake.Util
-        Development.Shake.Internal.Value
         General.Bilist
         General.Binary
         General.Cleanup

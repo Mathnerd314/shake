@@ -14,7 +14,7 @@ import Control.Monad.IO.Class
 import System.Directory
 import System.IO.Extra hiding (withTempFile, withTempDir, readFile')
 
-import Development.Shake.Internal.Core.Run
+import Development.Shake.Internal.Core.Rules
 import Development.Shake.Internal.Rules.File
 import qualified Data.ByteString as BS
 import Data.Hashable

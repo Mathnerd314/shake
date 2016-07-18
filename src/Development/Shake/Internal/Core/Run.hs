@@ -2,13 +2,12 @@
 {-# LANGUAGE ExistentialQuantification, MultiParamTypeClasses, ConstraintKinds, ViewPatterns, TupleSections #-}
 
 module Development.Shake.Internal.Core.Run(
-    run,
-    Action, actionOnException, actionFinally, apply, apply1, traced, getShakeOptions, getProgress,
+    run', actionOnException, actionFinally, applyKeyValue, traced, getShakeOptions, getProgress,
     trackUse, trackChange, trackAllow,
     getVerbosity, putLoud, putNormal, putQuiet, withVerbosity, quietly,
-    Resource, newResource, newResourceIO, withResource, withResources, newThrottle, newThrottleIO,
-    newCache, newCacheIO,
-    unsafeExtraThread, unsafeAllowApply,
+    Resource, newResource, withResource, withResources, newThrottle,
+    newCache,
+    unsafeExtraThread,
     parallel,
     orderOnlyAction,
     -- Internal stuff
@@ -37,13 +36,11 @@ import Numeric.Extra
 
 import Development.Shake.Classes
 import Development.Shake.Internal.Core.Action
-import Development.Shake.Internal.Core.Rules
 import Development.Shake.Internal.Core.Pool
 import Development.Shake.Internal.Core.Database
 import Development.Shake.Internal.Core.Rendezvous
 import Development.Shake.Internal.Core.Monad
 import Development.Shake.Internal.Resource
-import Development.Shake.Internal.Value
 import Development.Shake.Internal.Profile
 import Development.Shake.Internal.Types
 import Development.Shake.Internal.Errors
@@ -60,12 +57,8 @@ import Prelude
 -- MAKE
 
 -- | Internal main function (not exported publicly)
-run :: ShakeOptions -> Rules () -> IO ()
-run opts@ShakeOptions{..} rs = (if shakeLineBuffering then lineBuffering else id) $ do
-    opts@ShakeOptions{..} <- if shakeThreads /= 0 then return opts else do p <- getProcessorCount; return opts{shakeThreads=p}
-    start <- offsetTime
-    (actions, ruleinfo) <- runRules opts rs
-
+run' :: ShakeOptions -> [ActionP k ()] -> BuildKey k -> IO ()
+run' opts@ShakeOptions{..} actions ruleinfo = do
     outputLocked <- do
         lock <- newLock
         return $ \v msg -> withLock lock $ shakeOutput v msg
@@ -192,38 +185,8 @@ lineBuffering act = do
 basicLint :: Lint -> Bool
 basicLint = (/= LintNothing)
 
--- | Execute a rule, returning the associated values. If possible, the rules will be run in parallel.
---   This function requires that appropriate rules have been added with 'rule'.
---   All @key@ values passed to 'apply' become dependencies of the 'Action'.
-apply :: (ShakeValue key, ShakeValue value) => [key] -> Action [value]
-apply = applyForall
-
--- | Return the values associated with an already-executed rule, throwing an error if the
---   rule would need to be re-run.
---   This function requires that appropriate rules have been added with 'rule'.
---   All @key@ values passed to 'applied' become dependencies of the 'Action'.
-applied :: (ShakeValue key, ShakeValue value) => [key] -> Action [value]
-applied ks = blockApply "'applied' key" (applyForall ks)
-
--- We don't want the forall in the Haddock docs
--- Don't short-circuit [] as we still want error messages
-applyForall :: forall key value . (ShakeValue key, ShakeValue value) => [key] -> Action [value]
-applyForall ks = do
-    let tk = typeOf (err "apply key" :: key)
-        tv = typeOf (err "apply type" :: value)
-    Global{..} <- Action getRO
-    -- this duplicates the check in runKey, but we can give better error messages here
-    case Map.lookup tk globalRules of
-        Nothing -> liftIO $ errorNoRuleToBuildType tk (show <$> listToMaybe ks) (Just tv)
-        _ -> return ()
-    vs <- applyKeyValue (map newKey ks)
-    let f k (resultValue -> v) = case fromDynamic v of
-            Just v -> return v
-            Nothing -> liftIO $ errorRuleTypeMismatch tk (Just $ show k) (dynTypeRep v) tv
-    zipWithM f ks vs
-
 -- | The monomorphic function underlying 'apply', for those who need it
-applyKeyValue :: [Key] -> Action [LiveResult]
+applyKeyValue :: [k] -> ActionP k [LiveResult]
 applyKeyValue [] = return []
 applyKeyValue ks = do
     global@Global{..} <- Action getRO
@@ -242,7 +205,7 @@ applyKeyValue ks = do
 -- | Turn a normal exception into a ShakeException, giving it a stack and printing it out if in staunch mode.
 --   If the exception is already a ShakeException (e.g. it's a child of ours who failed and we are rethrowing)
 --   then do nothing with it.
-shakeException :: Global -> IO [String] -> SomeException -> IO ShakeException
+shakeException :: Global k -> IO [String] -> SomeException -> IO ShakeException
 shakeException Global{globalOptions=ShakeOptions{..},..} stk e@(SomeException inner) = case cast inner of
     Just e@ShakeException{} -> return e
     Nothing -> do
@@ -252,16 +215,11 @@ shakeException Global{globalOptions=ShakeOptions{..},..} stk e@(SomeException in
             globalOutput Quiet $ show e ++ "Continuing due to staunch mode"
         return e
 
--- | Apply a single rule, equivalent to calling 'apply' with a singleton list. Where possible,
---   use 'apply' to allow parallelism.
-apply1 :: (ShakeValue key, ShakeValue value) => key -> Action value
-apply1 = fmap head . apply . return
-
 ---------------------------------------------------------------------
 -- TRACKING
 
 -- | Track that a key has been used by the action preceeding it.
-trackUse :: ShakeValue key => key -> Action ()
+trackUse :: key -> ActionP key ()
 -- One of the following must be true:
 -- 1) you are the one building this key (e.g. key == topStack)
 -- 2) you have already been used by apply, and are on the dependency list
@@ -284,7 +242,7 @@ trackUse key = do
             Action $ putRW l{localTrackUsed = k : localTrackUsed} -- condition 4
 
 
-trackCheckUsed :: Action ()
+trackCheckUsed :: ActionP key ()
 trackCheckUsed = do
     Global{..} <- Action getRO
     Local{..} <- Action getRW
@@ -311,7 +269,7 @@ trackCheckUsed = do
 
 
 -- | Track that a key has been changed by the action preceeding it.
-trackChange :: ShakeValue key => key -> Action ()
+trackChange :: key -> ActionP key ()
 -- One of the following must be true:
 -- 1) you are the one building this key (e.g. key == topStack)
 -- 2) someone explicitly gave you permission with trackAllow
@@ -332,92 +290,21 @@ trackChange key = do
 
 
 -- | Allow any matching key to violate the tracking rules.
-trackAllow :: ShakeValue key => (key -> Bool) -> Action ()
-trackAllow = trackAllowForall
-
--- We don't want the forall in the Haddock docs
-trackAllowForall :: forall key . ShakeValue key => (key -> Bool) -> Action ()
-trackAllowForall test = do
+trackAllow :: (key -> Bool) -> ActionP key ()
+trackAllow test = do
     Global{..} <- Action getRO
     when (basicLint $ shakeLint globalOptions) $ Action $ modifyRW $ \s -> s{localTrackAllows = f : localTrackAllows s}
     where
-        tk = typeOf (err "trackAllow key" :: key)
-        f k = typeKey k == tk && fmap test (fromKey k) == Just True
 
 ---------------------------------------------------------------------
 -- RESOURCES
-
--- | Create a finite resource, given a name (for error messages) and a quantity of the resource that exists.
---   Shake will ensure that actions using the same finite resource do not execute in parallel.
---   As an example, only one set of calls to the Excel API can occur at one time, therefore
---   Excel is a finite resource of quantity 1. You can write:
---
--- @
--- 'Development.Shake.shake' 'Development.Shake.shakeOptions'{'Development.Shake.shakeThreads'=2} $ do
---    'Development.Shake.want' [\"a.xls\",\"b.xls\"]
---    excel <- 'Development.Shake.newResource' \"Excel\" 1
---    \"*.xls\" 'Development.Shake.%>' \\out ->
---        'Development.Shake.withResource' excel 1 $
---            'Development.Shake.cmd' \"excel\" out ...
--- @
---
---   Now the two calls to @excel@ will not happen in parallel.
---
---   As another example, calls to compilers are usually CPU bound but calls to linkers are usually
---   disk bound. Running 8 linkers will often cause an 8 CPU system to grid to a halt. We can limit
---   ourselves to 4 linkers with:
---
--- @
--- disk <- 'Development.Shake.newResource' \"Disk\" 4
--- 'Development.Shake.want' [show i 'Development.Shake.FilePath.<.>' \"exe\" | i <- [1..100]]
--- \"*.exe\" 'Development.Shake.%>' \\out ->
---     'Development.Shake.withResource' disk 1 $
---         'Development.Shake.cmd' \"ld -o\" [out] ...
--- \"*.o\" 'Development.Shake.%>' \\out ->
---     'Development.Shake.cmd' \"cl -o\" [out] ...
--- @
-newResource :: String -> Int -> Rules Resource
-newResource name mx = liftIO $ newResourceIO name mx
-
-
--- | Create a throttled resource, given a name (for error messages) and a number of resources (the 'Int') that can be
---   used per time period (the 'Double' in seconds). Shake will ensure that actions using the same throttled resource
---   do not exceed the limits. As an example, let us assume that making more than 1 request every 5 seconds to
---   Google results in our client being blacklisted, we can write:
---
--- @
--- google <- 'Development.Shake.newThrottle' \"Google\" 1 5
--- \"*.url\" 'Development.Shake.%>' \\out -> do
---     'Development.Shake.withResource' google 1 $
---         'Development.Shake.cmd' \"wget\" [\"http:\/\/google.com?q=\" ++ 'Development.Shake.FilePath.takeBaseName' out] \"-O\" [out]
--- @
---
---   Now we will wait at least 5 seconds after querying Google before performing another query. If Google change the rules to
---   allow 12 requests per minute we can instead use @'Development.Shake.newThrottle' \"Google\" 12 60@, which would allow
---   greater parallelisation, and avoid throttling entirely if only a small number of requests are necessary.
---
---   In the original example we never make a fresh request until 5 seconds after the previous request has /completed/. If we instead
---   want to throttle requests since the previous request /started/ we can write:
---
--- @
--- google <- 'Development.Shake.newThrottle' \"Google\" 1 5
--- \"*.url\" 'Development.Shake.%>' \\out -> do
---     'Development.Shake.withResource' google 1 $ return ()
---     'Development.Shake.cmd' \"wget\" [\"http:\/\/google.com?q=\" ++ 'Development.Shake.FilePath.takeBaseName' out] \"-O\" [out]
--- @
---
---   However, the rule may not continue running immediately after 'Development.Shake.withResource' completes, so while
---   we will never exceed an average of 1 request every 5 seconds, we may end up running an unbounded number of
---   requests simultaneously. If this limitation causes a problem in practice it can be fixed.
-newThrottle :: String -> Int -> Double -> Rules Resource
-newThrottle name count period = liftIO $ newThrottleIO name count period
 
 -- | Run an action which uses part of a finite resource. For more details see 'Resource'.
 --   Note that if you call 'withResource' while a resource is held, and the new resource is not
 --   available, all resources held will be released while waiting for the new resource, and
 --   re-acquired after; this may cause undesirable behavior. Also note that 'need' and 'apply'
 --   will similarly release all resources while executing a dependency, and re-acquire them later.
-withResource :: Resource -> Int -> Action a -> Action a
+withResource :: Resource -> Int -> ActionP k a -> ActionP k a
 withResource r i act = do
     Global{..} <- Action getRO
     liftIO $ globalDiagnostic $ show r ++ " waiting to acquire " ++ show i
@@ -435,7 +322,7 @@ withResource r i act = do
 -- | Run an action which uses part of several finite resources. Acquires the resources in a stable
 --   order, to prevent deadlock. If all rules requiring more than one resource acquire those
 --   resources with a single call to 'withResources', resources will not deadlock.
-withResources :: [(Resource, Int)] -> Action a -> Action a
+withResources :: [(Resource, Int)] -> ActionP k a -> ActionP k a
 withResources res act
     | (r,i):_ <- filter ((< 0) . snd) res = error $ "You cannot acquire a negative quantity of " ++ show r ++ ", requested " ++ show i
     | otherwise = f $ groupBy ((==) `on` fst) $ sortBy (compare `on` fst) res
@@ -444,43 +331,7 @@ withResources res act
         f (r:rs) = withResource (fst $ head r) (sum $ map snd r) $ f rs
 
 
--- | A version of 'newCache' that runs in IO, and can be called before calling 'Development.Shake.shake'.
---   Most people should use 'newCache' instead.
-newCacheIO :: (Eq k, Hashable k) => (k -> Action v) -> IO (k -> Action v)
-newCacheIO act = do
-    var {- :: Var (Map k (Fence (Either SomeException ([Depends],v)))) -} <- newVar Map.empty
-    return $ \key ->
-        join $ liftIO $ modifyVar var $ \mp -> case Map.lookup key mp of
-            Just bar -> return $ (,) mp $ do
-                res <- liftIO $ testFence bar
-                (res,offset) <- case res of
-                    Just res -> return (res, 0)
-                    Nothing -> do
-                        pool <- Action $ getsRO globalPool
-                        offset <- liftIO offsetTime
-                        Action $ captureRAW $ \k -> waitFence bar $ \v ->
-                            addPool pool $ do offset <- liftIO offset; k $ Right (v,offset)
-                case res of
-                    Left err -> Action $ throwRAW err
-                    Right (deps,v) -> do
-                        Action $ modifyRW $ \s -> s{localDepends = deps <> localDepends s, localDiscount = localDiscount s + offset}
-                        return v
-            Nothing -> do
-                bar <- newFence
-                return $ (,) (Map.insert key bar mp) $ do
-                    pre <- Action $ getsRW localDepends
-                    res <- Action $ tryRAW $ fromAction $ act key
-                    case res of
-                        Left err -> do
-                            liftIO $ signalFence bar $ Left err
-                            Action $ throwRAW err
-                        Right v -> do
-                            post <- Action $ getsRW localDepends
-                            let deps = subtractDepends pre post
-                            liftIO $ signalFence bar $ Right (deps, v)
-                            return v
-
--- | Given an action on a key, produce a cached version that will execute the action at most once per key.
+-- | Given an action on a key, produce a cached version that will execute the action at most once per key per Shake invocation.
 --   Using the cached result will still result include any dependencies that the action requires.
 --   Each call to 'newCache' creates a separate cache that is independent of all other calls to 'newCache'.
 --
@@ -500,27 +351,57 @@ newCacheIO act = do
 --
 --   To create the result @MyFile.txt.digits@ the file @MyFile.txt@ will be read and counted, but only at most
 --   once per execution.
-newCache :: (Eq k, Hashable k) => (k -> Action v) -> Rules (k -> Action v)
-newCache = liftIO . newCacheIO
+newCache :: (Eq k, Hashable k, MonadIO m) => (k -> ActionP k v) -> m (k -> ActionP k v)
+newCache act = liftIO $ do
+    var {- :: Var (Map k (Fence (Either SomeException ([Depends],v)))) -} <- newVar Map.empty
+    return $ \key ->
+        join $ liftIO $ modifyVar var $ \mp -> case Map.lookup key mp of
+            Just bar -> return $ (,) mp $ do
+                res <- liftIO $ testFence bar
+                (res,offset) <- case res of
+                    Just res -> return (res, 0)
+                    Nothing -> do
+                        pool <- Action $ getsRO globalPool
+                        offset <- liftIO offsetTime
+                        Action $ captureRAW $ \k -> waitFence bar $ \v ->
+                            addPool pool $ do offset <- liftIO offset; k $ Right (v,offset)
+                case res of
+                    Left err -> ActionP k $ throwRAW err
+                    Right (deps,v) -> do
+                        Action $ modifyRW $ \s -> s{localDepends = deps <> localDepends s, localDiscount = localDiscount s + offset}
+                        return v
+            Nothing -> do
+                bar <- newFence
+                return $ (,) (Map.insert key bar mp) $ do
+                    pre <- Action $ getsRW localDepends
+                    res <- Action $ tryRAW $ fromAction $ act key
+                    case res of
+                        Left err -> do
+                            liftIO $ signalFence bar $ Left err
+                            Action $ throwRAW err
+                        Right v -> do
+                            post <- Action $ getsRW localDepends
+                            let deps = subtractDepends pre post
+                            liftIO $ signalFence bar $ Right (deps, v)
+                            return v
 
-
--- | Run an action without counting to the thread limit, typically used for actions that execute
---   on remote machines using barely any local CPU resources.
---   Unsafe as it allows the 'shakeThreads' limit to be exceeded.
---   You cannot depend on a rule (e.g. 'need') while the extra thread is executing.
---   If the rule blocks (e.g. calls 'withResource') then the extra thread may be used by some other action.
---   Only really suitable for calling 'cmd'/'command'.
-unsafeExtraThread :: Action a -> Action a
+-- | Temporarily release this thread's resource, allowing other threads to run.
+--   Typically used for actions that execute on remote machines using barely any local CPU resources.
+--   Unsafe as it allows the 'shakeThreads' limit to be exceeded, although
+--   the number of threads that are not within an unsafeExtraThread section will still be at most shakeThreads.
+--   Calling dependencies (e.g. 'need') from within unsafeExtraThread will still use a thread.
+unsafeExtraThread :: ActionP k a -> ActionP k a
 unsafeExtraThread act = Action $ do
     Global{..} <- getRO
-    stop <- liftIO $ increasePool globalPool
     res <- tryRAW $ fromAction $ blockApply "Within unsafeExtraThread" act
     liftIO stop
     captureRAW $ \continue -> (if isLeft res then addPoolHighPriority else addPoolMediumPriority) globalPool $ continue res
 
 
 -- | Execute a list of actions in parallel. In most cases 'need' will be more appropriate to benefit from parallelism.
-parallel :: [Action a] -> Action [a]
+--   'need' takes a single database lock and uses as many cached values as possible, while 'parallel' will have to lock many times
+--   and must spawn a thread regardless of caching.
+parallel :: [ActionP k a] -> ActionP k [a]
 parallel [] = return []
 parallel [x] = fmap return x
 parallel acts = Action $ do
