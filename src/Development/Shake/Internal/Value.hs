@@ -6,10 +6,7 @@
 This module implements the Key/Value types, to abstract over hetrogenous data types.
 -}
 module Development.Shake.Internal.Value(
-    Value,  Key(..), newKey, fromKey, fromKeyDef,
-    Witness, currentWitness, registerWitness,
-    pokeType, putKeyWith, peekType, getKeyWith,
-    ShakeValue
+    Value(..),  Key(..), ShakeValue
     ) where
 
 import Development.Shake.Classes
@@ -55,99 +52,4 @@ import System.IO.Unsafe
 type ShakeValue a = (Show a, Typeable a, Eq a, Hashable a, Store a, NFData a)
 
 type Value = BS.ByteString
-
-data Key = Key
-  { typeKey :: TypeRep
-  , keyString :: Value
-  }
-    deriving (Typeable,Eq,Show,Hashable,NFData,Generic)
-
-pokeType :: Witness -> TypeRep -> Poke ()
-pokeType ws t = do
-    let msg = "no witness for " ++ show t
-    poke $ fromMaybe (error msg) $ Map.lookup t (witnessOut ws)
-
-peekType :: Witness -> Peek TypeRep
-peekType ws = do
-    h <- peek
-    case Map.lookup h $ witnessIn ws of
-        Nothing | h >= 0 && h < genericLength (typeNames ws) -> fail $
-            "Failed to find a type " ++ (typeNames ws !! fromIntegral h) ++ " which is stored in the database.\n" ++
-            "The most likely cause is that your build tool has changed significantly."
-        Nothing -> fail $
-            -- should not happen, unless proper data corruption
-            "Corruption when reading Value, got type " ++ show h ++ ", but should be in range 0.." ++ show (length (typeNames ws) - 1)
-        Just ty -> return ty
-
-putKeyWith :: Witness -> Key -> Poke ()
-putKeyWith ws (Key t v) = do
-    pokeType ws t
-    pokeBS v
-
-getKeyWith :: Witness -> Peek Key
-getKeyWith ws = do
-    ty <- peekType ws
-    Key ty <$> peekBS
-
-newKey :: (Typeable a, Store a) => a -> Key
-newKey a = Key (typeOf a) (encode a)
-
-fromKey :: (Typeable a, Store a) => Key -> Maybe a
-fromKey (Key t v) = case decode v of
-    Right r | t == typeOf r -> Just r
-            | otherwise     -> Nothing
-
-fromKeyDef :: (Typeable a, Store a) => Key -> a -> a
-fromKeyDef (Key t v) def = case decode v of
-    Right r | t == typeOf r -> r
-            | otherwise     -> def
-
----------------------------------------------------------------------
--- BINARY INSTANCES
-
-{-# NOINLINE witness #-}
-witness :: IORef (Set.HashSet TypeRep)
-witness = unsafePerformIO $ newIORef Set.empty
-
-registerWitness :: (Typeable a) => Proxy a -> IO ()
-registerWitness x = registerWitness' (typeRep x)
-
-registerWitness' :: TypeRep -> IO ()
-registerWitness' x = atomicModifyIORef witness $ \mp -> (Set.insert x mp, ())
-
--- Produce a list in a predictable order from a Map TypeRep, which should be consistent regardless of the order
--- elements were added and stable between program executions.
--- Don't rely on the hashmap order since that might not be stable, if hashes clash.
-toStableList :: Ord k => Set.HashSet k -> [k]
-toStableList = sort . Set.toList
-
-data Witness = Witness
-    {typeNames :: [String] -- the canonical data, the names of the types
-    ,witnessIn :: Map.HashMap Word16 TypeRep -- for reading in, find the values (some may be missing)
-    ,witnessOut :: Map.HashMap TypeRep Word16 -- for writing out, find the value
-    }
-
-instance Eq Witness where
-    -- Type names are produced by toStableList so should to remain consistent
-    -- regardless of the order of registerWitness calls.
-    a == b = typeNames a == typeNames b
-
-currentWitness :: IO Witness
-currentWitness = do
-    ws <- readIORef witness
-    let ks = toStableList ws
-    return $ Witness (map show ks) (Map.fromList $ zip [0..] ks) (Map.fromList $ zip ks [0..])
-
-instance Store Witness where
-    size = contramapSize (\(Witness ts _ _) -> ts) size
-    poke (Witness ts _ _) = poke ts
-    peek = do
-        ts <- peek
-        let ws = toStableList $ unsafePerformIO $ readIORefAfter ts witness
-        let ks = [ k | t <- ts, let k = head $ filter ((==) t . show) ws]
-        return $ Witness ts (Map.fromList $ zip [0..] ks) (Map.fromList $ zip ks [0..])
-        where
-            -- Read an IORef after examining a variable, used to avoid GHC over-optimisation
-            {-# NOINLINE readIORefAfter #-}
-            readIORefAfter :: a -> IORef b -> IO b
-            readIORefAfter v ref = v `seq` readIORef ref
+type Key = BS.ByteString

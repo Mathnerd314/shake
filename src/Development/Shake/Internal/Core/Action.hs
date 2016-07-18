@@ -2,13 +2,12 @@
 {-# LANGUAGE ExistentialQuantification, MultiParamTypeClasses, ConstraintKinds #-}
 
 module Development.Shake.Internal.Core.Action(
-    RuleInfo(..), Global(..), Local(..), Action(..),
+    Global(..), Local(..), Action(..),
     newLocal,
     runAction, actionOnException, actionFinally,
     getShakeOptions, getProgress, runAfter,
     getVerbosity, putWhen, putLoud, putNormal, putQuiet, withVerbosity, quietly,
-    blockApply, unsafeAllowApply,
-    traced
+    traced, orderOnlyAction
     ) where
 
 import Control.Exception.Extra
@@ -16,11 +15,10 @@ import Control.Applicative
 import Control.Monad.Extra
 import Control.Monad.IO.Class
 import Control.DeepSeq
-import Data.Typeable
+import Data.Dynamic
 import Data.Function
 import Data.Either.Extra
 import qualified Data.HashMap.Strict as Map
-import Data.Maybe
 import Data.IORef
 import System.IO.Extra
 import System.Time.Extra
@@ -29,6 +27,7 @@ import Numeric.Extra
 import Development.Shake.Internal.Core.Pool
 import Development.Shake.Internal.Core.Database
 import Development.Shake.Internal.Core.Monad
+import Development.Shake.Internal.Core.Types
 import Development.Shake.Internal.Value
 import Development.Shake.Internal.Types
 import General.Cleanup
@@ -44,20 +43,13 @@ import Prelude
 newtype Action a = Action {fromAction :: RAW Global Local a}
     deriving (Functor, Applicative, Monad, MonadIO, Typeable)
 
-data BuiltinRule_ = BuiltinRule_ (Key -- ^ Key that you want to build.
-                               -> Maybe Result -- ^ the previous result in the database, if any
-                               -> Bool -- ^ 'True' if any dependency has changed, or if Shake has no memory of this rule.
-                               -> Action (BuiltinResult Dynamic) -- ^ result of executing the rule
-                                 )
-
 -- global constants of Action
 data Global = Global
     {globalDatabase :: Database
     ,globalPool :: Pool
     ,globalCleanup :: Cleanup
     ,globalTimestamp :: IO Seconds
-    ,globalRules :: Map.HashMap TypeRep (BuiltinRule Action)
-    ,globalUserRules :: Map.HashMap TypeRep RuleSet
+    ,globalReadKey :: ByteString -> IO Key
     ,globalOutput :: Verbosity -> String -> IO ()
     ,globalOptions  :: ShakeOptions
     ,globalDiagnostic :: String -> IO ()
@@ -76,19 +68,6 @@ runAction g l (Action x) = runRAW g l x
 
 ---------------------------------------------------------------------
 -- EXCEPTION HANDLING
-
--- | Turn a normal exception into a ShakeException, giving it a stack and printing it out if in staunch mode.
---   If the exception is already a ShakeException (e.g. it's a child of ours who failed and we are rethrowing)
---   then do nothing with it.
-shakeException :: Global -> IO [String] -> SomeException -> IO ShakeException
-shakeException Global{globalOptions=ShakeOptions{..},..} stk e@(SomeException inner) = case cast inner of
-    Just e@ShakeException{} -> return e
-    Nothing -> do
-        stk <- stk
-        e <- return $ ShakeException (last $ "Unknown call stack" : stk) stk e
-        when (shakeStaunch && shakeVerbosity >= Quiet) $
-            globalOutput Quiet $ show e ++ "Continuing due to staunch mode"
-        return e
 
 actionBoom :: Bool -> Action a -> IO b -> Action a
 actionBoom runOnSuccess act clean = do
@@ -173,19 +152,6 @@ withVerbosity new = Action . unmodifyRW f . fromAction
 --   not turn off any 'Diagnostic' tracing.
 quietly :: Action a -> Action a
 quietly = withVerbosity Quiet
-
----------------------------------------------------------------------
--- Messing with apply
-
-unsafeAllowApply :: Action a -> Action a
-unsafeAllowApply  = applyBlockedBy Nothing
-
-blockApply :: String -> Action a -> Action a
-blockApply = applyBlockedBy . Just
-
-applyBlockedBy :: Maybe String -> Action a -> Action a
-applyBlockedBy reason = Action . unmodifyRW f . fromAction
-    where f s0 = (s0{localBlockApply=reason}, \s -> s{localBlockApply=localBlockApply s0})
 
 -- | Run an action but do not depend on anything the action uses.
 --   A more general version of 'orderOnly'.

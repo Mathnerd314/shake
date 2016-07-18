@@ -1,4 +1,4 @@
-{-# LANGUAGE RecordWildCards, ViewPatterns #-}
+{-# LANGUAGE RecordWildCards, ViewPatterns, DeriveDataTypeable, DeriveGeneric #-}
 
 module Development.Shake.Internal.Resource(
     Resource, newResourceIO, newThrottleIO, acquireResource, releaseResource
@@ -15,7 +15,66 @@ import Development.Shake.Internal.Core.Pool
 import System.Time.Extra
 import Data.Monoid
 import Prelude
+import Control.Monad
+import Data.Typeable
+import GHC.Generics
+import qualified Data.HashMap.Strict as Map
+import System.Random
 
+---------------------------------------------------------------------
+-- UNFAIR/RANDOM QUEUE
+
+-- Monad for non-deterministic (but otherwise pure) computations
+type NonDet a = IO a
+
+-- | A FIFO queue for priority actions plus low-priority pending actions.
+--   Left = deterministic FIFO list, Right = non-deterministic tree
+data Queue a = Queue (Bilist a) (Either (Bilist a) (Tree a))
+
+newQueue :: Bool -> Queue a
+newQueue deterministic = Queue mempty $ if deterministic then Left mempty else Right emptyTree
+
+enqueuePriority :: a -> Queue a -> Queue a
+enqueuePriority x (Queue p t) = Queue (x `cons` p) t
+
+enqueue :: a -> Queue a -> Queue a
+enqueue x (Queue p (Left xs)) = Queue p $ Left $ xs `snoc` x
+enqueue x (Queue p (Right t)) = Queue p $ Right $ insertTree x t
+
+dequeue :: Queue a -> NonDet (Maybe (a, Queue a))
+dequeue (Queue pl t) = case uncons pl of
+  Just (p,ps) -> return $ Just (p, Queue ps t)
+  Nothing -> case t of
+     Left bl -> return $ case (uncons bl) of
+        Just (x,xs) -> Just (x, Queue [] $ Left xs)
+        Nothing -> Nothing
+     Right t -> do
+        bs <- randomIO
+        return $ case removeTree bs t of
+            Nothing -> Nothing
+            Just (x,t) -> Just (x, Queue [] $ Right t)
+
+-- | A tree with fast removal. Nodes are stored at indicies 0..n-1. TODO: use array instead?
+data Tree a = Tree {-# UNPACK #-} !Int (Map.HashMap Int a)
+
+emptyTree :: Tree a
+emptyTree = Tree 0 Map.empty
+
+insertTree :: a -> Tree a -> Tree a
+insertTree x (Tree n mp) = Tree (n+1) $ Map.insert n x mp
+
+-- Remove an item, put the n-1 item to go in it's place
+removeTree :: Int -> Tree a -> Maybe (a, Tree a)
+removeTree rnd (Tree n mp)
+        | n == 0 = Nothing
+        | n == 1 = Just (mp Map.! 0, emptyTree)
+        | i == n-1 = Just (mp Map.! i, Tree (n-1) $ Map.delete i mp)
+        | otherwise = Just (mp Map.! i, Tree (n-1) $ Map.insert i (mp Map.! (n-1)) $ Map.delete (n-1) mp)
+    where
+        i = abs rnd `mod` n
+
+---------------------------------------------------------------------
+-- RESOURCES
 
 {-# NOINLINE resourceIds #-}
 resourceIds :: Var Int
@@ -35,8 +94,8 @@ resourceId = modifyVar resourceIds $ \i -> let j = i + 1 in j `seq` return (j, j
 --   over a short time period.
 --
 --   These resources are used with 'Development.Shake.withResource' when defining rules. Typically only
---   IO-intensive or heavy system commands (such as 'Development.Shake.cmd') should be run inside 'Development.Shake.withResource',
---   as commands such as 'Development.Shake.need' automatically use a CPU thread resource.
+--   IO-intensive system commands (such as 'Development.Shake.cmd') should be run inside 'Development.Shake.withResource',
+--   as 'Development.Shake.need' automatically uses a CPU thread resource.
 --
 --   Be careful that the actions run within 'Development.Shake.withResource' do not themselves require further
 --   copies of the resource, or you may get a \"thread blocked indefinitely in an MVar operation\" exception.
@@ -44,7 +103,7 @@ resourceId = modifyVar resourceIds $ \i -> let j = i + 1 in j `seq` return (j, j
 data Resource = Resource
     {resourceOrd :: Int
         -- ^ Key used for Eq/Ord operations. To make withResources work, we require newResourceIO < newThrottleIO
-    ,resourceShow :: String
+    ,resourceShow :: IO String
         -- ^ String used for Show
     ,acquireResource :: Pool -> Int -> IO () -> IO ()
         -- ^ Acquire the resource and call the function.
@@ -56,14 +115,27 @@ instance Show Resource where show = resourceShow
 instance Eq Resource where (==) = (==) `on` resourceOrd
 instance Ord Resource where compare = compare `on` resourceOrd
 
+worker :: Pool -> IO ()
+worker todo = now >> worker pool
+
+data Priority = LowPriority -- ^ Low priority is suitable for new tasks that are just starting. Currently equivalent to Medium.
+              | MediumPriority -- ^ Medium priority is suitable for tasks that are resuming running after a pause.
+              | HighPriority -- ^ High priority is suitable for tasks that have detected failure and are resuming to propagate that failure.
+  deriving (Eq,Ord,Show,Read,Typeable,Generic,Enum,Bounded)
+
+addQueue HighPriority = enqueuePriority
+addQueue _ = enqueue
 
 ---------------------------------------------------------------------
 -- FINITE RESOURCES
 
 data Finite = Finite
-    {finiteAvailable :: !Int
+    {finiteAvailable :: {-# UNPACK #-} !Int
         -- ^ number of currently available resources
-    ,finiteWaiting :: Bilist (Int, IO ())
+    ,finiteLimit :: {-# UNPACK #-} !Int -- ^ supplied resource limit, = finiteAvailable + acquired resources
+    ,finiteMin :: {-# UNPACK #-} !Int -- ^ low water mark of available resources (accounting only)
+    ,finiteSum :: {-# UNPACK #-} !Int -- ^ number of resources we have been through (accounting only)
+    ,finiteWaiting :: Queue (Int, IO ())
         -- ^ queue of people with how much they want and the action when it is allocated to them
     }
 
@@ -74,10 +146,16 @@ newResourceIO name mx = do
     when (mx < 0) $
         errorIO $ "You cannot create a resource named " ++ name ++ " with a negative quantity, you used " ++ show mx
     key <- resourceId
-    var <- newVar $ Finite mx mempty
+    var <- newVar $ Finite mx mx 0 0 mempty
     return $ Resource (negate key) shw (acquire var) (release var)
     where
-        shw = "Resource " ++ name
+        shw var = do
+          Finite{..} <- readVar var
+          return $ "Resource " ++ name ++ " ("
+              ++ show finiteAvailable ++ " available, "
+              ++ show finiteLimit ++ " max, used"
+              ++ show (finiteLimit - finiteMin) ++ " max &"
+              ++ show finiteSum ++ " total)"
 
         acquire :: Var Finite -> Pool -> Int -> IO () -> IO ()
         acquire var pool want continue
@@ -85,19 +163,24 @@ newResourceIO name mx = do
             | want > mx = errorIO $ "You cannot acquire more than " ++ show mx ++ " of " ++ shw ++ ", requested " ++ show want
             | otherwise = join  $ modifyVar var $ \x@Finite{..} -> return $
                 if want <= finiteAvailable then
-                    (x{finiteAvailable = finiteAvailable - want}, continue)
+                    (x{ finiteAvailable = finiteAvailable - want
+                      , finiteSum = finiteSum + want
+                      , finiteMin = (finiteAvailable - want) `min` finiteMin}
+                    , continue)
                 else
-                    (x{finiteWaiting = finiteWaiting `snoc` (want, addPool MediumPriority pool continue)}, return ())
+                    (x{finiteWaiting = addQueue MediumPriority (want, continue) finiteWaiting}, return ())
 
         release :: Var Finite -> Pool -> Int -> IO ()
-        release var _ i = join $ modifyVar var $ \x -> return $ f x{finiteAvailable = finiteAvailable x + i}
+        release var pool i = join $ modifyVar var $ \x -> f x{finiteAvailable = finiteAvailable x + i}
             where
-                f (Finite i (uncons -> Just ((wi,wa),ws)))
-                    | wi <= i = second (wa >>) $ f $ Finite (i-wi) ws
-                    | otherwise = first (add (wi,wa)) $ f $ Finite i ws
-                f (Finite i _) = (Finite i mempty, return ())
-                add a s = s{finiteWaiting = a `cons` finiteWaiting s}
-
+                f fin@Finite{..} = do
+                  res <- dequeue finiteWaiting
+                  case res of
+                      Just ((wi,wa),ws)
+                          | wi <= finiteAvailable -> do
+                              (val,ret) <- f $ fin { finiteAvailable = finiteAvailable - wi, finiteWaiting = ws }
+                              return (val, wa >> ret)
+                      _ -> (fin, return ())
 
 ---------------------------------------------------------------------
 -- THROTTLE RESOURCES
@@ -135,9 +218,15 @@ newThrottleIO name count period = do
         errorIO $ "You cannot create a throttle named " ++ name ++ " with a negative quantity, you used " ++ show count
     key <- resourceId
     var <- newVar $ ThrottleAvailable count
-    return $ Resource key shw (acquire var) (release var)
+    return $ Resource key (shw var) (acquire var) (release var)
     where
-        shw = "Throttle " ++ name
+        shw var = do
+          t <- readVar var
+          return $ "Throttle " ++ name ++ " ("
+              ++ case t of
+                    ThrottleAvailable i -> show i ++ " available)"
+                    ThrottleWaiting _ _ -> "waiting)"
+
 
         acquire :: Var Throttle -> Pool -> Int -> IO () -> IO ()
         acquire var pool want continue

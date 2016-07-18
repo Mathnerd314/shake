@@ -1,5 +1,5 @@
 {-# LANGUAGE RecordWildCards, GeneralizedNewtypeDeriving, DeriveFunctor, ScopedTypeVariables, PatternGuards #-}
-{-# LANGUAGE ExistentialQuantification, MultiParamTypeClasses, ConstraintKinds, ViewPatterns #-}
+{-# LANGUAGE ExistentialQuantification, MultiParamTypeClasses, ConstraintKinds, ViewPatterns, TupleSections #-}
 
 module Development.Shake.Internal.Core.Run(
     run,
@@ -40,6 +40,7 @@ import Development.Shake.Internal.Core.Action
 import Development.Shake.Internal.Core.Rules
 import Development.Shake.Internal.Core.Pool
 import Development.Shake.Internal.Core.Database
+import Development.Shake.Internal.Core.Rendezvous
 import Development.Shake.Internal.Core.Monad
 import Development.Shake.Internal.Resource
 import Development.Shake.Internal.Value
@@ -57,104 +58,6 @@ import Prelude
 
 ---------------------------------------------------------------------
 -- MAKE
-
--- | Define a built-in Shake rule.
---
---   A rule for a type of artifacts (e.g. /files/) provides:
---
--- * How to identify artifacts, given by the @key@ type.
---
--- * A way to produce a 'BuiltinResult', given the key value, the previous result, and whether
---   any dependencies have changed. Usually, this will 'userRule' to get the user-defined rules,
---   but you can use 'getUserRules' for customized matching behavior or avoid user rules entirely.
---
---   As an example, below is a simplified rule for building files, where files are identified
---   by a 'FilePath' and their state is identified by their modification time.
---   (the builtin functions 'Development.Shake.need' and 'Development.Shake.%>'
---   provide a similar rule).
---
--- @
--- newtype File = File FilePath deriving (Show, Typeable, Eq, Hashable, Binary, NFData)
--- newtype FileRule = FileRule { fromFileRule :: FilePath -> Maybe (Action ())) }
--- newtype ModTime = ...
--- getFileModtime :: FilePath -> Action ModTime
--- getFileModtime file = ...
---
--- fileRule :: 'Rules' ()
--- fileRule = 'addBuiltinRule' $ (\(File x) d dep = do
---         d2 <- getFileModtime x
---         let uptodate = d == Just d2 && not dep
---         urule <- 'userRule' fromFileRule x
---         case urule of
---             Just act | not uptodate -> do
---                 act
---                 d3 <- getFileModtime x
---                 return $ BuiltinResult (encode d3) () True (d == Just d3)
---             _ -> return $ BuiltinResult (encode d2) () False (d == Just d2)
--- @
---
---   This example instance means:
---
--- * A value of type @File@ uniquely identifies a file
---
--- * A user may add rules using the @FileRule@ type; they are executed if the modification
---   time changed or was not stored in Shake's database, or if a dependency changed.
---
--- * Running the rule stores a 'ModTime' modification time but returns '()' from 'apply'
---
--- * Rules depending on this rule will re-run if the modification time changed from its stored value.
---
---   A simple build system can be created for the instance above with:
---
--- @
--- -- Produce foo files using fooCC. For every output file \"filename.foo\" there must be an
--- -- input file named \"filename\".
--- compileFoo :: 'Rules' ()
--- compileFoo = 'alternatives' $ do
---     'addUserRule' (FileRule touch)
---     'addUserRule' (FileRule compile)
---     'action' ('apply' \"filename\")
---     where
---         compile :: FilePath -> Maybe ('Action' ())
---         compile outputFile = when (takeExtension outputFile == \"foo\") . Just $ do
---             -- figure out the name of the input file
---             let inputFile = dropExtension outputFile
---             'unit' $ 'apply' (File inputFile)
---             'unit' $ 'Development.Shake.cmd' \"fooCC\" inputFile outputFile
--- @
---
---   /Note:/ Dependencies between output and input files are /not/ expressed by
---   rules, but instead by invocations of 'apply' within the rules.
---   The timestamps of the files are only compared to themselves; Shake uses its
---   own (logical) clock for tracking dependencies.
---
--- addBuiltinRule :: (ShakeValue key, ShakeValue value) => (key -> Maybe value -> Bool -> Action (BuiltinResult value)) -> Rules ()
-addBuiltinRule :: (Typeable key, Binary key, Binary vsto, Typeable vdyn) => (key -> Maybe vsto -> Bool -> Action (BuiltinResult vdyn)) -> Rules ()
-addBuiltinRule act = newRules mempty{rules = Map.singleton kt f}
-    where
-    kt = typeOf $ (undefined :: (key -> foo) -> key) act
-    f = BuiltinRule { execute = \k' vo' dep -> do
-        let k = fromKeyDef k' (err "addBuiltinRule: incorrect type")
-        let vo = fmap (decode . result) vo'
-        fmap toDyn <$> act k vo dep
-    }
-
--- | A simplified built-in rule that runs on every Shake invocation, caches its value between runs, and uses Eq for equality.
--- simpleCheck :: (ShakeValue key, ShakeValue value) => (key -> Action value) -> Rules ()
-simpleCheck act = addBuiltinRule $ \k vo _ -> do
-    v <- act k
-    return $ BuiltinResult (encode v) v True (maybe False ((==) v) vo)
-
--- | The default user rule system, processing alternatives and priorities but disallowing multiple matching rules
-userRule :: (Show k, Typeable k, Typeable a) => (a -> k -> Maybe b) -> k -> Action (Maybe b)
-userRule from k = do
-    u <- getUserRules
-    case u of
-        Nothing -> return Nothing
-        Just u -> case userRuleMatch (fmap (($k) . from) u) of
-            [r]:_ -> return $ Just r
-            rs:_  -> liftIO $ errorMultipleRulesMatch (typeOf k) (Just $ show k) (length rs)
-            []    -> return Nothing
 
 -- | Internal main function (not exported publicly)
 run :: ShakeOptions -> Rules () -> IO ()
@@ -236,8 +139,7 @@ run opts@ShakeOptions{..} rs = (if shakeLineBuffering then lineBuffering else id
                         runPool (shakeThreads == 1) shakeThreads $ \pool -> do
                             let opts2 = opts{shakeRunCommands=RunMinimal}
                             let s0 = Global database pool cleanup start (rules rs) (userrules rs) output opts2 diagnostic lint after absent getProgress
-                            forM_ ks $ \(i,(key,v)) -> case v of
-                                Ready ro -> do
+                            forM_ ks $ \(i,(key,v)) -> do
                                     let reply = undefined
 --     -- Do not use a forM here as you use too much stack space
 --     bad <- (\f -> foldM f [] status) $ \seen (i,v) -> case v of
@@ -327,34 +229,28 @@ applyKeyValue ks = do
     global@Global{..} <- Action getRO
     stack <- Action $ getsRW localStack
     block <- Action $ getsRW localBlockApply
-    (dur, dep, vs) <- Action $ captureRAW $ build globalPool globalDatabase (Ops (runKey_ global)) stack block ks
-    (dur, dep, vs) <- Action $ captureRAW $ build globalPool globalDatabase (BuildKey $ runKey global) stack ks
+    time <- liftIO offsetTime
+    (dep, vs) <- Action $ captureRAW $ \cont -> do
+        (dep, w) <- build globalPool globalDatabase (runKey global) stack ks
+        case w of
+          Now v -> cont (dep,v)
+          Wait w -> afterWaiting w (addPool HighPriority pool . cont . (dep,))
+    dur <- time
     Action $ modifyRW $ \s -> s{localDiscount=localDiscount s + dur, localDepends=dep <> localDepends s}
     return vs
 
-runKey :: Global -> Stack -> Step -> Key -> Maybe Result -> Bool -> Capture (Either SomeException (Bool, BuiltinResult))
-runKey global@Global{globalOptions=ShakeOptions{..},..} stack step k r dirtyChildren continue = do
-    time <- liftIO $ offsetTime
-    let s = newLocal stack shakeVerbosity
-    runAction global s (do
-        let top = showTopStack stack
-        let tk = typeKey k
-        case Map.lookup tk globalRules of
-            Nothing -> liftIO $ errorNoRuleToBuildType tk (Just $ show k) Nothing
-            Just BuiltinRule{..} -> do
-                liftIO $ evaluate $ rnf k
-                liftIO $ globalLint $ "before building " ++ top
-                putWhen Chatty $ "# " ++ show k
-                let r' = if shakeRead then r else Nothing
-                res <- execute k r' dirtyChildren
-                when (LintFSATrace == shakeLint) trackCheckUsed
-                liftIO $ globalLint $ "after building " ++ top
-                dur <- liftIO time
-                local <- Action $ getRW
-                let ans = (res, dur, local)
-                liftIO $ evaluate $ rnf ans
-                return ans
-                ) continue
+-- | Turn a normal exception into a ShakeException, giving it a stack and printing it out if in staunch mode.
+--   If the exception is already a ShakeException (e.g. it's a child of ours who failed and we are rethrowing)
+--   then do nothing with it.
+shakeException :: Global -> IO [String] -> SomeException -> IO ShakeException
+shakeException Global{globalOptions=ShakeOptions{..},..} stk e@(SomeException inner) = case cast inner of
+    Just e@ShakeException{} -> return e
+    Nothing -> do
+        stk <- stk
+        e <- return $ ShakeException (last $ "Unknown call stack" : stk) stk e
+        when (shakeStaunch && shakeVerbosity >= Quiet) $
+            globalOutput Quiet $ show e ++ "Continuing due to staunch mode"
+        return e
 
 -- | Apply a single rule, equivalent to calling 'apply' with a singleton list. Where possible,
 --   use 'apply' to allow parallelism.
