@@ -66,14 +66,14 @@ data Database k = Database
 data Status
     = Ready LiveResult -- ^ I have a value
     | Error SomeException -- ^ I have been run and raised an error
-    | Waiting (Waiting Status) -- ^ Checking/building subdependencies
+    | Waiting (Waiting (Either SomeException LiveResult) -- ^ Checking/building subdependencies
                                -- The Waiting is called only with Ready or Error
-    | Loaded Result -- ^ Stored value
+    | Pending (Set.HashSet Id) (Either LiveResult Result) -- ^ Stored value that needs to be checked
       deriving Show
 
 data Result = Result
-    {resultStore :: {-# UNPACK #-} !ByteString -- ^ the result to store for the Key
-    ,built :: {-# UNPACK #-} !Step -- ^ when it was actually run
+    {resultStore :: {-# UNPACK #-} !ByteString -- ^ serialized result for the Key
+    ,built :: {-# UNPACK #-} !Step -- ^ when it was last run / checked
     ,changed :: {-# UNPACK #-} !Step -- ^ the step for deciding if it's valid
     ,depends :: Depends -- ^ dependencies (stored in order of appearance; don't run them early)
     ,execution :: {-# UNPACK #-} !Float -- ^ how long it took when it was last run (seconds)
@@ -81,7 +81,7 @@ data Result = Result
 
 data LiveResult = LiveResult
     {resultValue :: Dynamic -- ^ dynamic return value limited to lifetime of the program
-    ,built :: {-# UNPACK #-} !Step -- ^ when it was actually run
+    ,built :: {-# UNPACK #-} !Step -- ^ when it was last run / checked
     ,changed :: {-# UNPACK #-} !Step -- ^ the step for deciding if it's valid
     ,depends :: Depends -- ^ dependencies (stored in order of appearance; don't run them early)
     ,execution :: {-# UNPACK #-} !Float -- ^ how long it took when it was last run (seconds)
@@ -98,9 +98,9 @@ type BuildKey k
          = Stack -- Given the current stack with the key added on
         -> Step -- And the current step
         -> k -- The key to build
-        -> Maybe Result -- A previous result, or Nothing if never been built before
+        -> Maybe (Either LiveResult Result) -- A previous result, or Nothing if never been built before
         -> Bool -- True if any of the children were dirty
-        -> Capture (Either SomeException (Bool, Result))
+        -> Capture (Either SomeException (Bool, LiveResult))
             -- Either an error, or a result.
 
 internKey :: InternDB k -> k -> IO Id
@@ -117,7 +117,7 @@ atom x = let s = show x in if ' ' `elem` s then "(" ++ s ++ ")" else s
 
 updateStatus :: Database k -> Id -> k -> Status -> IO ()
 updateStatus Database{..} i k v done = do
-    -- this can only be full if we're called from reportResult
+    -- this can only be full if we're called from reportResult in spawn
     (oldk,oldv) <- fmap fst &&& fmap snd <$> Ids.lookup status i
     Ids.insert status i (k,v)
     diagnostic $ maybe "Missing" show oldv ++ " -> " ++ show v ++ ", " ++ maybe "<unknown>" show oldk

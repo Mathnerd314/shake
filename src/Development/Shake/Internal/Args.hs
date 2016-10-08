@@ -264,7 +264,7 @@ escape code x = "\ESC[" ++ code ++ "m" ++ x ++ "\ESC[0m"
 shakeOptsEx :: [(Bool, OptDescr (Either String ([Extra], ShakeOptions -> ShakeOptions)))]
 shakeOptsEx =
     [yes $ Option "a" ["abbrev"] (pairArg "abbrev" "FULL=SHORT" $ \a s -> s{shakeAbbreviations=shakeAbbreviations s ++ [a]}) "Use abbreviation in status messages."
-    ,yes $ Option "B" ["always-make"] (noArg $ \s -> s{shakeRead=False}) "Unconditionally make all targets."
+    ,yes $ Option "B" ["always-make"] (noArg $ \s -> s{shakeRead=False}) "Unconditionally make all targets, skipping the database."
     ,no  $ Option ""  ["no-build"] (NoArg $ Right ([NoBuild], id)) "Don't build anything."
     ,no  $ Option "C" ["directory"] (ReqArg (\x -> Right ([ChangeDirectory x],id)) "DIRECTORY") "Change to DIRECTORY before doing anything."
     ,yes $ Option ""  ["color","colour"] (NoArg $ Right ([Color], \s -> s{shakeOutput=outputColor (shakeOutput s)})) "Colorize the output."
@@ -287,8 +287,8 @@ shakeOptsEx =
     ,yes $ Option ""  ["live"] (OptArg (\x -> Right ([], \s -> s{shakeLiveFiles=shakeLiveFiles s ++ [fromMaybe "live.txt" x]})) "FILE") "List the files that are live [to live.txt]."
     ,yes $ Option "m" ["metadata"] (reqArg "PREFIX" $ \x s -> s{shakeFiles=x}) "Prefix for storing metadata files."
     ,no  $ Option ""  ["numeric-version"] (NoArg $ Right ([NumericVersion],id)) "Print just the version number and exit."
-    ,no  $ Option "o" ["old-file","assume-old"] (ReqArg (\x -> Right ([AssumeOld x],id)) "FILE") "Consider FILE to be very old and don't remake it."
-    ,yes $ Option ""  ["old-all"] (noArg $ \s -> s{shakeRunCommands=RunMinimal}) "Don't remake any files."
+    ,no  $ Option "o" ["old-file","assume-old"] (ReqArg (\x -> Right ([AssumeOld x],id)) "FILE") "Assume FILE is old and does not need to be rebuilt."
+    ,yes $ Option ""  ["old-all"] (noArg $ \s -> s{shakeRunCommands=RunMinimal}) "Mark all files as old and not needing to be rebuilt."
     ,yes $ Option ""  ["assume-skip"] (noArg $ \s -> s{shakeRunCommands=RunMinimal, shakeWrite=False}) "Don't remake any files this run."
     ,yes $ Option ""  ["skip-commands"] (noArg $ \s -> s{shakeRunCommands=RunUser}) "Try and avoid running external programs."
     ,yes $ Option "r" ["report","profile"] (OptArg (\x -> Right ([], \s -> s{shakeReport=shakeReport s ++ [fromMaybe "report.html" x]})) "FILE") "Write out profiling information [to report.html]."
@@ -309,7 +309,7 @@ shakeOptsEx =
     ,no  $ Option "v" ["version"] (NoArg $ Right ([Version],id)) "Print the version number and exit."
     ,no  $ Option "w" ["print-directory"] (NoArg $ Right ([PrintDirectory True],id)) "Print the current directory."
     ,no  $ Option ""  ["no-print-directory"] (NoArg $ Right ([PrintDirectory False],id)) "Turn off -w, even if it was turned on implicitly."
-    ,no  $ Option "W" ["what-if","new-file","assume-new"] (ReqArg (\x -> Right ([AssumeNew x],id)) "FILE") "Consider FILE to be infinitely new."
+    ,no  $ Option "W" ["what-if","new-file","assume-new"] (ReqArg (\x -> Right ([AssumeNew x],id)) "FILE") "Consider FILE to be infinitely new and needing a rebuild."
     ]
     where
         yes = (,) True

@@ -185,21 +185,19 @@ lineBuffering act = do
 basicLint :: Lint -> Bool
 basicLint = (/= LintNothing)
 
--- | The monomorphic function underlying 'apply', for those who need it
+-- | Execute a list of keys, adding them as dependencies, returning the associated values.
+--   The rules will be run in parallel, subject to the thread limit.
 applyKeyValue :: [k] -> ActionP k [LiveResult]
 applyKeyValue [] = return []
 applyKeyValue ks = do
-    global@Global{..} <- Action getRO
+    Global{..} <- Action getRO
     stack <- Action $ getsRW localStack
-    block <- Action $ getsRW localBlockApply
-    time <- liftIO offsetTime
-    (dep, vs) <- Action $ captureRAW $ \cont -> do
-        (dep, w) <- build globalPool globalDatabase (runKey global) stack ks
+    (dep, vs) <- traced' "apply" $ Action $ captureRAW $ \cont -> do
+        (dep, w) <- build globalPool globalDatabase globalRun stack ks
         case w of
           Now v -> cont (dep,v)
           Wait w -> afterWaiting w (addPool HighPriority pool . cont . (dep,))
-    dur <- time
-    Action $ modifyRW $ \s -> s{localDiscount=localDiscount s + dur, localDepends=dep <> localDepends s}
+    Action $ modifyRW $ \s -> s{localDepends=dep <> localDepends s}
     return vs
 
 -- | Turn a normal exception into a ShakeException, giving it a stack and printing it out if in staunch mode.
@@ -218,13 +216,8 @@ shakeException Global{globalOptions=ShakeOptions{..},..} stk e@(SomeException in
 ---------------------------------------------------------------------
 -- TRACKING
 
--- | Track that a key has been used by the action preceeding it.
+-- | Track that a file has been read by the action preceeding it.
 trackUse :: key -> ActionP key ()
--- One of the following must be true:
--- 1) you are the one building this key (e.g. key == topStack)
--- 2) you have already been used by apply, and are on the dependency list
--- 3) someone explicitly gave you permission with trackAllow
--- 4) at the end of the rule, a) you are now on the dependency list, and b) this key itself has no dependencies (is source file)
 trackUse key = do
     Global{..} <- Action getRO
     l@Local{..} <- Action getRW
@@ -241,7 +234,10 @@ trackUse key = do
         else
             Action $ putRW l{localTrackUsed = k : localTrackUsed} -- condition 4
 
+Track that a key has been changed by the action; the key is either building, given permission with trackAllow, or untracked and not in the database
+Allow any matching key to violate the tracking rules.
 
+-- | Check that no values were used but not depended upon or built after being used
 trackCheckUsed :: ActionP key ()
 trackCheckUsed = do
     Global{..} <- Action getRO
@@ -270,6 +266,9 @@ trackCheckUsed = do
 
 -- | Track that a key has been changed by the action preceeding it.
 trackChange :: key -> ActionP key ()
+-- * The build result does not depend on the previous external state
+--   If an external datum is modified, then every rule reading that datum must execute afterwards.
+
 -- One of the following must be true:
 -- 1) you are the one building this key (e.g. key == topStack)
 -- 2) someone explicitly gave you permission with trackAllow
@@ -307,14 +306,9 @@ trackAllow test = do
 withResource :: Resource -> Int -> ActionP k a -> ActionP k a
 withResource r i act = do
     Global{..} <- Action getRO
-    liftIO $ globalDiagnostic $ show r ++ " waiting to acquire " ++ show i
-    offset <- liftIO offsetTime
-    Action $ captureRAW $ \continue -> acquireResource r globalPool i $ continue $ Right ()
-    res <- Action $ tryRAW $ fromAction $ blockApply ("Within withResource using " ++ show r) $ do
-        offset <- liftIO offset
-        liftIO $ globalDiagnostic $ show r ++ " acquired " ++ show i ++ " in " ++ showDuration offset
-        Action $ modifyRW $ \s -> s{localDiscount = localDiscount s + offset}
-        act
+    traced' (show r ++ " waiting to acquire " ++ show i) $
+      Action $ captureRAW $ \continue -> acquireResource r globalPool i $ continue $ Right ()
+    res <- act
     liftIO $ releaseResource r globalPool i
     liftIO $ globalDiagnostic $ show r ++ " released " ++ show i
     Action $ either throwRAW return res

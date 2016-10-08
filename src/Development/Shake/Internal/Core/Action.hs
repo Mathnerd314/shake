@@ -180,11 +180,11 @@ traced s a = traced' s (liftIO a)
 
 traced' :: String -> ActionP k a -> ActionP k a
 traced' msg act = do
-    Global{..} <- Action getRO
+    g@Global{..} <- Action getRO
     stack <- Action $ getsRW localStack
     start <- liftIO globalTimestamp
     putNormal $ "# " ++ msg ++ " (for " ++ showTopStack stack ++ ")"
-    res <- act
+    res <- act g stack
     stop <- liftIO globalTimestamp
     let trace = Trace (pack msg) (doubleToFloat start) (doubleToFloat stop)
     liftIO $ evaluate $ rnf trace

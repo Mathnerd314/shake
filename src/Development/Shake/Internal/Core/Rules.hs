@@ -125,32 +125,6 @@ data BuiltinRule_ = forall k v. BuiltinRule_ (BuiltinRule k v)
 
 data UserRule_ = forall a . Typeable a => UserRule_ (UserRule a)
 
--- correct - obvious for a deterministic build, not so clear otherwise, but the notion exists nonetheless
--- consistent - all rules have been run successfully & have correct outputs. a 'clean build'
---   a change from another process (or the user) creates an inconsistency
--- sound - all inconsistency is unstable/temporary & disappears after re-running the build tool
---  opposite: stable inconsistency - "stuck", running build tool again does not restore consistency, incorrect outputs remain incorrect
--- A proper build tool is sound
---   Shake will still keep stale top-level outputs, and their dependencies; they can be deleted with --prune.
---   However, it will delete intermediate generated files if they are unused.
---   Shake will not re-run rules in the middle of a run unless the file monitor is enabled
-
-
--- * external state is tracked by the build system
---   An action cannot execute dependencies after reading an external datum; you must move the read operation to a new rule if you wish to execute further keys.
--- * external state is minimized
---   Once the datum is read, it must not change for the rest of the build run.
--- * The build result does not depend on the previous external state
---   If an external datum is modified, then every rule reading that datum must execute afterwards.
-
-
--- Shake supports 4 methods for the generated-file, dynamic-file-list problem; listed from most efficient to least efficient:
--- 1. Direct dependency: the file list action is given a-priori knowledge to call the generator action.
--- 2. Interleaved execution: the file list action scans the files, runs plausible generating actions untracked (perhaps with orderOnly), and writes a dependency list a-posteriori.
--- 3. Weak dependency: sequential ordering of dependencies ensures that all relevant generated files are created before the file list is built
--- 4. Eventual consistency: the filesystem is monitored, regenerating the list on every update; any rules depending on the list are added to a pending queue which is run periodically. Eventually, if all goes well, all files will be generated and the system will stabilize.
-
-
 -- | A 'Match' data type, representing user-defined rules associated with a particular type.
 --   As an example '?>' and '*>' will add entries to the 'Match' data type.
 --
