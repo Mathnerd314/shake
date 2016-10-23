@@ -1,0 +1,38 @@
+digraph G
+{
+	{
+		node [shape=house]
+		l1 l2 l3 p1 p2
+	}
+	{
+		node [shape=diamond]
+		"eval p1"
+		"eval p2"
+		"eval l1"
+		"eval l2"
+		"eval l3"
+	}
+	{
+		node [shape=triangle]
+		"plus l1 l2"
+		"plus p1 l3"
+		"plus l3 p1"
+		"1" "2" "3" "5"
+	}
+	{
+		node [shape=square]
+		e_p1 e_p2 e_l1 e_l2 e_l3
+	}
+	"eval l1" -> e_l1 -> l1 -> {"1" "5"}
+	"eval l2" -> e_l2 -> l2 -> "2"
+	"eval l3" -> e_l3 -> l3 -> "3"
+	"eval p1" -> e_p1 -> {p1 e_p1_1}
+	"eval p2" -> e_p2 -> {p2 e_p2_1}
+	e_p1_1 -> {"eval l1" "eval l2"}
+	e_p2_1 -> {"eval p1" "eval l3"}
+	p1 -> "plus l1 l2"
+	p2 -> "plus l3 p1"
+	p2 -> "plus p1 l3"
+	r1 -> "eval p1"
+	r2 -> "eval p2"
+}
