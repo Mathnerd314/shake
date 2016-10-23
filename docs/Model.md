@@ -3,26 +3,41 @@
 Shake takes as primitive a notion of correctness based on a mapping from input dictionaries to resultant dictionaries. Conceptually, the world may be represented as a key-value dictionary (for example, a physics model might map (particle name, time) to position and other state), so this is quite generic. In particular Shake assumes that correctness follows "the Shake model", a Haskell library loosely similar to imperative-style Shake programs.
 
 First, we have dictionaries, which we'll represent as functions for now:
+
     type Dictionary = Key -> Value
+
 Rules are functions on dictionaries:
+
     type Rule = Dictionary -> Dictionary
 			  = Dictionary -> Key -> Value
+
 Need and apply translate as function application:
+
     apply [a "x"] --> \d k -> a "x" d k
+
 For parallel application, we require that each changed key is changed only once:
+
     parallel [a,b] --> \d k -> case filter (/= d k) . map (\x -> x d k) $ [a,b] of
         [] -> d k
         [a] -> a
         _ -> undefined
+
 In the real Shake, need and apply have implicit calls to parallel, so they take multiple arguments.
 
 External commands as well as liftIO etc. translate as pure Haskell functions on the dictionary:
+
     cmd $ "gcc a.c -o a.o" --> \d k -> if k == "a.o" then gcc (d "a.c") else d k
+
 Reading a file is a key lookup:
+
     readFile "x" --> d "x"
+
 Monadic computation translates as composition (Haskell values are erased; if they are relevant they can be stored in the dictionary):
+
     a >> b --> \d k -> let d' = a d in b d' k
+
 Default rules for source files translate as identity:
+
     need [source_file] --> id
 
 # Hermetic Builds
@@ -45,6 +60,7 @@ Separately, we want to minimize the number of update operations U available, ide
 # Rules
 
 To have something to incrementalize, we start by introducing a notion of "rule", explicitly dividing up the overall input-output function into the composition of lots of small functions using 'parallel' or '.'. Rules can be as coarse or as fine as necessary, but we of course prefer smaller rules since they often allow more work to be skipped. Following Nominal Adapton (or maybe just Haskell's 'let' syntax), we also allow rules to be assigned names so that work can be shared. Shake allows names to be any serializable Haskell ADT and includes an extensible default ADT. Traces then have an acyclic data structure that looks like
+
 	data Trace = Trace (Map Input Stamp) (Map Output Stamp) | Parallel [Trace] | Sequential [Trace] | Named Name
 	data Traces = Traces { root :: Name, Map Name Trace }
 
@@ -53,13 +69,15 @@ Rules can take many forms, but they must record an accurate trace of input/outpu
 We depict traces as a graph; names are diamonds, sequential traces are squares, parallel traces are circles, and the final key-value pairs are a house-triangle combination. Our dependencies go from top to bottom, so that "top-level" commands are actually on the top. There is no inner/outer layer separation.
 
 For example, the trace of the sum computation given in the Adapton paper:
-![Graph](Model.svg)
+
+![Graph](https://cdn.rawgit.com/Mathnerd314/shake/devel-new/docs/Model.svg)
 
 # Modifiables
 
 Looking at our keys, most will only take one value over the full trace. We thus maintain an index from keys to (rules, stamps) so that they do not have to be constantly passed around. The list of rules for which a certain value holds can be optimized using the DAG structure of rule names to only store the rules that output values.
 
 However, Shake goes further because we don't want to keep multiple versions of files around in the main system. E.g., considering an action such as
+
     do
       (n :: Int) <- read <$> readFile "a"
       writeFile "a" (show $ n + 1)
