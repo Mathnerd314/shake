@@ -49,13 +49,15 @@ We can summarize execution by the sets of input and output (key,stamp) pairs. Th
 # Incremental changes
 
 The world (input dictionary) is not static, so we incrementalize the model. We want to have correct incremental builds for hermetic systems where all changes are registered, in that they vaguely match the pure model or a from-scratch build. Alternately expressed, given state X, change A with inverse A', and updating operation U, we want 
-XAUA'U = XAA'U = XU
+
+    XAUA'U = XAA'U = XU
 
 Separately, we want to minimize the number of update operations U available, ideally to just 1 command that does everything. But there are always a few extensions that seem necessary:
-1) partial updates, so that only a few files are rebuilt
-2) touch, which marks the current values as up-to-date
-3) cleaning, where all updates are discarded and the system is restored to its initial condition
-4) queries, where you just want to know what could change
+
+1. partial updates, so that only a few files are rebuilt
+2. touch, which marks the current values as up-to-date
+3. cleaning, where all updates are discarded and the system is restored to its initial condition
+4. queries, where you just want to know what could change
 
 # Rules
 
@@ -90,7 +92,7 @@ we would have to store both values of n (so as to avoid seeing n+2). Solutions:
 
 Erroring is the best option, since the build system developer must then explicitly pick which file to redirect. So we error on a key read if Shake hasn't already written the key; in this example the first read. Of course, this would mean that Shake can't read any external input, so we have special operations to create a key as input or copied input, with associated checks to ensure they're used correctly (input: cannot change during the run; copied input: copy cannot change during run, input is re-copied if changed by external program, moved back if cleaned).
 
-There's a similar problem with double writes, where we lose the ability to re-run the build system. Again we want to error out if a key is written twice, so that the build system developer can make the decision of where else to store the first or second value. Similarly, we also want to give an (optional) data loss warning if a generated file already exists when the rule declares that it's about to write to it. (Post-declared files have already been overwritten by the time Shake gets to them, so they can still cause an error, but there's no way to recover) So all these are also handled by special operations which check for an existing rule and then do the approprate thing if there's no rule. And sometimes between-run persistence is actually desired, e.g. when command-line options change a config file for all future runs, which we solve by adding an operation for a "sticky" read.
+There's a similar problem with double writes, where we lose the ability to re-run the build system. Again we want to error out if a key is written twice, so that the build system developer can make the decision of where else to store the first or second value. Similarly, we also want to give an (optional) data loss warning if a generated file already exists when the rule declares that it's about to write to it. (Post-declared files have already been overwritten by the time Shake gets to them, so they can still cause an error, but there's no way to recover) So all these are also handled by special operations which check for an existing rule and then do the appropriate thing if there's no rule. And sometimes between-run persistence is actually desired, e.g. when command-line options change a config file for all future runs, which we solve by adding an operation for a "sticky" read.
 
 On the other hand, sometimes it might useful to allow multiple values. Part of it's just being general. Maybe the build system is so complex that using a content-addressed store for files makes sense. We also want multiple values so we can store previous runs for posterity; e.g. inject changes then immediately rollback. And of course there's the whole substitutes thing.
 
@@ -100,7 +102,7 @@ The hard part is using the rule trace DAG to determine a proper "logical time" s
 
 The simple algorithm just follows demands down, starting from each top-level demanded rule. 
 We look at the traces:
-- for a name, we check to see if it's already been proceseed, otherwise process its trace and re-execute if out of date (typically we can only really enter named rules, so the below ones will begin execution at the name rather than the part of the trace)
+- for a name, we check to see if it's already been processed, otherwise process its trace and re-execute if out of date (typically we can only really enter named rules, so the below ones will begin execution at the name rather than the part of the trace)
 - for a (parallel|sequential) trace, we process (in parallel|sequentially) and re-execute if any are out-of-date
 - for an actual trace, we check that each input matches its stamp, and optionally that each output matches as well (since typically only one rule outputs and so stamp never changes)
 
